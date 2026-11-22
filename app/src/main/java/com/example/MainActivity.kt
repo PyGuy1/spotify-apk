@@ -1,17 +1,16 @@
 package com.example
 
+import android.Manifest
 import android.annotation.SuppressLint
-import android.content.ContentValues
+import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Message
-import android.provider.MediaStore
 import android.util.Base64
 import android.view.ViewGroup
-import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -42,23 +41,29 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
 import androidx.webkit.WebViewAssetLoader
+import com.example.bridge.PulseJsBridge
+import com.example.playback.PulsePlaybackService
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.ByteArrayOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 
 class MainActivity : ComponentActivity() {
 
   private var webView: WebView? = null
   private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
   private var pendingExportBytes: ByteArray? = null
-  private var pendingDownloadTrackJson: String? = null
+  private var controllerFuture: ListenableFuture<MediaController>? = null
+  private lateinit var pulseBridge: PulseJsBridge
+
+  private val requestNotificationsPermission =
+    registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ -> }
 
   private val pickImageLauncher =
     registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -70,12 +75,40 @@ class MainActivity : ComponentActivity() {
       completeFileChooser(uri?.let { arrayOf(it) })
     }
 
+  private val importAudioFilesLauncher =
+    registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+      if (uris.isNullOrEmpty()) return@registerForActivityResult
+      lifecycleScope.launch(Dispatchers.IO) {
+        val runtime = PulseRuntime.get(this@MainActivity)
+        var added = 0
+        for (uri in uris) {
+          try {
+            contentResolver.takePersistableUriPermission(
+              uri,
+              Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+          } catch (_: Exception) {}
+          if (runtime.downloadedRepo.importExternalUri(uri) != null) {
+            added++
+          }
+        }
+        runtime.downloadManager.syncLibraryAndNotify()
+        withContext(Dispatchers.Main) {
+          if (added > 0) {
+            Toast.makeText(
+              this@MainActivity,
+              "Added $added audio file${if (added == 1) "" else "s"} to Downloaded Songs",
+              Toast.LENGTH_SHORT,
+            ).show()
+          }
+        }
+      }
+    }
+
   private val createDocumentLauncher =
     registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
       val bytes = pendingExportBytes
-      val dlTrackJson = pendingDownloadTrackJson
       pendingExportBytes = null
-      pendingDownloadTrackJson = null
       val uri = result.data?.data
       if (result.resultCode == RESULT_OK && uri != null && bytes != null) {
         lifecycleScope.launch(Dispatchers.IO) {
@@ -86,11 +119,9 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
               false
             }
-          withContext(Dispatchers.Main) {
-            if (!ok) {
+          if (!ok) {
+            withContext(Dispatchers.Main) {
               Toast.makeText(this@MainActivity, "Could not save file", Toast.LENGTH_SHORT).show()
-            } else if (dlTrackJson != null) {
-              notifySongDownloaded(dlTrackJson, uri.toString())
             }
           }
         }
@@ -103,6 +134,30 @@ class MainActivity : ComponentActivity() {
       statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
       navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
     )
+
+    requestNotificationPermissionIfNeeded()
+
+    pulseBridge =
+      PulseJsBridge(
+        context = applicationContext,
+        webViewProvider = { webView },
+        ensureServiceStarted = { ensureMediaControllerConnected() },
+        onSaveExportFile = { filename, mimeType, base64 ->
+          launchCreateDocumentExport(filename, mimeType, base64)
+        },
+        onRequestImportLocalAudio = {
+          try {
+            importAudioFilesLauncher.launch(arrayOf("audio/*"))
+          } catch (_: Exception) {
+            Toast.makeText(this, "Could not open audio picker", Toast.LENGTH_SHORT).show()
+          }
+        },
+      )
+    pulseBridge.attach()
+
+    lifecycleScope.launch(Dispatchers.IO) {
+      PulseRuntime.get(this@MainActivity).downloadManager.syncLibraryAndNotify()
+    }
 
     val assetLoader =
       WebViewAssetLoader.Builder()
@@ -143,6 +198,49 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  override fun onStart() {
+    super.onStart()
+    ensureMediaControllerConnected()
+    lifecycleScope.launch(Dispatchers.IO) {
+      PulseRuntime.get(this@MainActivity).downloadManager.syncLibraryAndNotify()
+    }
+  }
+
+  override fun onStop() {
+    val future = controllerFuture
+    controllerFuture = null
+    if (future != null) {
+      MediaController.releaseFuture(future)
+    }
+    super.onStop()
+  }
+
+  private fun ensureMediaControllerConnected() {
+    if (controllerFuture != null) return
+    val token = SessionToken(this, ComponentName(this, PulsePlaybackService::class.java))
+    val future = MediaController.Builder(this, token).buildAsync()
+    controllerFuture = future
+    future.addListener(
+      {
+        try {
+          future.get()
+        } catch (_: Exception) {}
+      },
+      MoreExecutors.directExecutor(),
+    )
+  }
+
+  private fun requestNotificationPermissionIfNeeded() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      val granted =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+          PackageManager.PERMISSION_GRANTED
+      if (!granted) {
+        requestNotificationsPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+      }
+    }
+  }
+
   @SuppressLint("SetJavaScriptEnabled")
   private fun createConfiguredWebView(
     context: android.content.Context,
@@ -172,7 +270,7 @@ class MainActivity : ComponentActivity() {
         loadWithOverviewMode = true
       }
 
-      addJavascriptInterface(ExportBridge(), "AndroidBridge")
+      addJavascriptInterface(pulseBridge, "AndroidBridge")
 
       webViewClient =
         object : WebViewClient() {
@@ -202,6 +300,7 @@ class MainActivity : ComponentActivity() {
 
           override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
+            pulseBridge.lastKnownMainFrameUrl = url.orEmpty()
             onCanGoBackChanged(view?.canGoBack() == true)
             view?.evaluateJavascript(BLOB_EXPORT_HOOK_JS, null)
           }
@@ -265,6 +364,30 @@ class MainActivity : ComponentActivity() {
     pendingFileCallback = null
   }
 
+  private fun launchCreateDocumentExport(filename: String, mimeType: String, base64: String) {
+    val bytes =
+      try {
+        Base64.decode(base64, Base64.DEFAULT)
+      } catch (_: Exception) {
+        return
+      }
+    runOnUiThread {
+      pendingExportBytes = bytes
+      val intent =
+        Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+          addCategory(Intent.CATEGORY_OPENABLE)
+          type = mimeType.ifBlank { "application/octet-stream" }
+          putExtra(Intent.EXTRA_TITLE, filename.ifBlank { "export" })
+        }
+      try {
+        createDocumentLauncher.launch(intent)
+      } catch (_: Exception) {
+        pendingExportBytes = null
+        Toast.makeText(this, "Could not open file saver", Toast.LENGTH_SHORT).show()
+      }
+    }
+  }
+
   private fun openExternalUri(uri: Uri) {
     try {
       startActivity(Intent(Intent.ACTION_VIEW, uri))
@@ -273,230 +396,8 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private inner class ExportBridge {
-    @JavascriptInterface
-    fun saveExportFile(filename: String, mimeType: String, base64Content: String) {
-      val bytes =
-        try {
-          Base64.decode(base64Content, Base64.DEFAULT)
-        } catch (_: Exception) {
-          return
-        }
-      runOnUiThread {
-        pendingExportBytes = bytes
-        val intent =
-          Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = mimeType.ifBlank { "application/octet-stream" }
-            putExtra(Intent.EXTRA_TITLE, filename.ifBlank { "export" })
-          }
-        try {
-          createDocumentLauncher.launch(intent)
-        } catch (_: Exception) {
-          pendingExportBytes = null
-          Toast.makeText(this@MainActivity, "Could not open file saver", Toast.LENGTH_SHORT).show()
-        }
-      }
-    }
-
-    @JavascriptInterface
-    fun downloadSong(
-      filename: String,
-      title: String,
-      artist: String,
-      urlsJson: String,
-      trackJson: String,
-    ) {
-      val urls =
-        try {
-          val arr = JSONArray(urlsJson)
-          List(arr.length()) { i -> arr.optString(i) }.filter { it.isNotBlank() }
-        } catch (_: Exception) {
-          emptyList()
-        }
-      if (urls.isEmpty()) {
-        showWebToast("Download unavailable for this song")
-        return
-      }
-      lifecycleScope.launch(Dispatchers.IO) {
-        performSongDownload(
-          baseFilename = filename.ifBlank { "song.m4a" },
-          title = title.ifBlank { "Song" },
-          artist = artist,
-          urls = urls,
-          trackJson = trackJson,
-        )
-      }
-    }
-  }
-
-  private suspend fun performSongDownload(
-    baseFilename: String,
-    title: String,
-    artist: String,
-    urls: List<String>,
-    trackJson: String,
-  ) {
-    withContext(Dispatchers.Main) { showWebToast("Downloading $title…") }
-    for (rawUrl in urls) {
-      var conn: HttpURLConnection? = null
-      try {
-        conn = openFollowedConnection(rawUrl) ?: continue
-        val contentType = (conn.contentType ?: "").lowercase()
-        if (contentType.contains("text/html") || contentType.contains("application/json")) {
-          continue
-        }
-        val (ext, mime) = resolveAudioFormat(contentType, baseFilename)
-        val stem = baseFilename.replace(Regex("\\.[a-zA-Z0-9]+$"), "")
-        val finalName = "$stem.$ext"
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-          val values =
-            ContentValues().apply {
-              put(MediaStore.Audio.Media.DISPLAY_NAME, finalName)
-              put(MediaStore.Audio.Media.MIME_TYPE, mime)
-              put(MediaStore.Audio.Media.TITLE, title)
-              if (artist.isNotBlank()) put(MediaStore.Audio.Media.ARTIST, artist)
-              put(MediaStore.Audio.Media.IS_MUSIC, 1)
-              put(MediaStore.Audio.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MUSIC}/Pulse")
-              put(MediaStore.Audio.Media.IS_PENDING, 1)
-            }
-          val resolver = contentResolver
-          val itemUri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values) ?: continue
-          var totalBytes = 0L
-          try {
-            resolver.openOutputStream(itemUri)?.use { out ->
-              conn.inputStream.use { input ->
-                val buf = ByteArray(16 * 1024)
-                while (true) {
-                  val read = input.read(buf)
-                  if (read <= 0) break
-                  out.write(buf, 0, read)
-                  totalBytes += read
-                }
-              }
-            }
-            if (totalBytes < 2048L) {
-              resolver.delete(itemUri, null, null)
-              continue
-            }
-            values.clear()
-            values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-            resolver.update(itemUri, values, null, null)
-            withContext(Dispatchers.Main) { notifySongDownloaded(trackJson, itemUri.toString()) }
-            return
-          } catch (_: Exception) {
-            resolver.delete(itemUri, null, null)
-          }
-        } else {
-          val buffer = ByteArrayOutputStream()
-          conn.inputStream.use { input ->
-            val chunk = ByteArray(16 * 1024)
-            while (true) {
-              val read = input.read(chunk)
-              if (read <= 0) break
-              buffer.write(chunk, 0, read)
-            }
-          }
-          val bytes = buffer.toByteArray()
-          if (bytes.size < 2048) continue
-          withContext(Dispatchers.Main) {
-            pendingExportBytes = bytes
-            pendingDownloadTrackJson = trackJson
-            val intent =
-              Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = mime
-                putExtra(Intent.EXTRA_TITLE, finalName)
-              }
-            try {
-              createDocumentLauncher.launch(intent)
-            } catch (_: Exception) {
-              pendingExportBytes = null
-              pendingDownloadTrackJson = null
-              showWebToast("Could not open file saver")
-            }
-          }
-          return
-        }
-      } catch (_: Exception) {
-        // Try next candidate stream URL.
-      } finally {
-        conn?.disconnect()
-      }
-    }
-    withContext(Dispatchers.Main) { showWebToast("Could not download this song right now") }
-  }
-
-  private fun openFollowedConnection(initialUrl: String): HttpURLConnection? {
-    var currentUrl = initialUrl
-    repeat(6) {
-      val conn =
-        (URL(currentUrl).openConnection() as? HttpURLConnection)?.apply {
-          instanceFollowRedirects = false
-          connectTimeout = 15000
-          readTimeout = 30000
-          setRequestProperty(
-            "User-Agent",
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
-          )
-        } ?: return null
-      val code = conn.responseCode
-      if (code in 300..399) {
-        val loc = conn.getHeaderField("Location")
-        conn.disconnect()
-        if (loc.isNullOrBlank()) return null
-        currentUrl = URL(URL(currentUrl), loc).toString()
-      } else if (code in 200..299) {
-        return conn
-      } else {
-        conn.disconnect()
-        return null
-      }
-    }
-    return null
-  }
-
-  private fun resolveAudioFormat(contentType: String, baseFilename: String): Pair<String, String> {
-    return when {
-      contentType.contains("webm") -> "webm" to "audio/webm"
-      contentType.contains("ogg") || contentType.contains("opus") -> "ogg" to "audio/ogg"
-      contentType.contains("mpeg") || contentType.contains("mp3") -> "mp3" to "audio/mpeg"
-      contentType.contains("mp4") || contentType.contains("m4a") || contentType.contains("aac") ->
-        "m4a" to "audio/mp4"
-      baseFilename.endsWith(".webm", ignoreCase = true) -> "webm" to "audio/webm"
-      baseFilename.endsWith(".ogg", ignoreCase = true) -> "ogg" to "audio/ogg"
-      baseFilename.endsWith(".mp3", ignoreCase = true) -> "mp3" to "audio/mpeg"
-      else -> "m4a" to "audio/mp4"
-    }
-  }
-
-  private fun notifySongDownloaded(trackJson: String, localUri: String) {
-    val wv = webView
-    if (wv != null) {
-      wv.post {
-        wv.evaluateJavascript(
-          "window.onSongDownloaded && window.onSongDownloaded(${JSONObject.quote(trackJson)}, ${JSONObject.quote(localUri)})",
-          null,
-        )
-      }
-    } else {
-      runOnUiThread { Toast.makeText(this, "Saved to Music/Pulse", Toast.LENGTH_SHORT).show() }
-    }
-  }
-
-  private fun showWebToast(message: String) {
-    val wv = webView
-    if (wv != null) {
-      wv.post {
-        wv.evaluateJavascript("window.toast && toast(${JSONObject.quote(message)})", null)
-      }
-    } else {
-      runOnUiThread { Toast.makeText(this, message, Toast.LENGTH_SHORT).show() }
-    }
-  }
-
   override fun onDestroy() {
+    pulseBridge.detach()
     webView?.let { wv ->
       (wv.parent as? ViewGroup)?.removeView(wv)
       wv.destroy()
