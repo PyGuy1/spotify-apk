@@ -1,0 +1,6 @@
+{
+  "name": "Pulse",
+  "description": "Music streaming player",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

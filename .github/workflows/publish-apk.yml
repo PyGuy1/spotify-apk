@@ -1,0 +1,78 @@
+name: Publish Android Debug APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'apk-distribution/app-debug.apk'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate compiled APK and checksum
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_PATH="apk-distribution/app-debug.apk"
+          SHA_PATH="apk-distribution/app-debug.apk.sha256"
+
+          if [[ ! -f "$APK_PATH" || ! -s "$APK_PATH" ]]; then
+            echo "::error::Missing or empty $APK_PATH"
+            exit 1
+          fi
+
+          if [[ ! -f "$SHA_PATH" ]]; then
+            echo "::error::Missing $SHA_PATH"
+            exit 1
+          fi
+
+          (cd apk-distribution && sha256sum -c app-debug.apk.sha256)
+          unzip -tq "$APK_PATH"
+
+          APK_SIZE_BYTES=$(stat -c%s "$APK_PATH")
+          APK_SIZE_HUMAN=$(numfmt --to=iec-i --suffix=B "$APK_SIZE_BYTES" 2>/dev/null || echo "${APK_SIZE_BYTES} bytes")
+          APK_SHA256=$(awk '{print $1}' "$SHA_PATH")
+
+          echo "size_bytes=${APK_SIZE_BYTES}" >> "$GITHUB_OUTPUT"
+          echo "size_human=${APK_SIZE_HUMAN}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="debug-apk-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          DIRECT_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/app-debug.apk"
+
+          NOTES=$(printf 'Prebuilt debug APK compiled in Google AI Studio.\n- File: app-debug.apk\n- Size: %s (%s bytes)\n- SHA-256: %s' "${{ steps.validate.outputs.size_human }}" "${{ steps.validate.outputs.size_bytes }}" "${{ steps.validate.outputs.sha256 }}")
+
+          gh release create "$TAG" \
+            "apk-distribution/app-debug.apk" \
+            --title "Pulse Debug APK (${TAG})" \
+            --notes "$NOTES" \
+            --latest
+
+          {
+            echo "## Android Debug APK Release Published"
+            echo ""
+            echo "- **Release Tag:** \`${TAG}\`"
+            echo "- **APK Size:** ${{ steps.validate.outputs.size_human }} (${{ steps.validate.outputs.size_bytes }} bytes)"
+            echo "- **SHA-256:** \`${{ steps.validate.outputs.sha256 }}\`"
+            echo "- **Release Page:** ${RELEASE_URL}"
+            echo "- **Direct Latest Download URL:** ${DIRECT_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
