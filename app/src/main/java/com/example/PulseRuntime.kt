@@ -99,6 +99,18 @@ class PulseRuntime private constructor(appContext: Context) {
           instance ?: PulseRuntime(context.applicationContext).also { instance = it }
         }
 
+    fun isNetworkAvailable(context: Context): Boolean {
+      return try {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+          ?: return true
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+      } catch (_: Exception) {
+        true
+      }
+    }
+
     fun detectNetworkTransport(context: Context): NetworkTransportKind {
       return try {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager

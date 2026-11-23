@@ -112,8 +112,12 @@ class InnerTubeXResolver(
     quality: String,
     forcePoToken: Boolean = false,
   ): ResolvedStream? {
-    cipherProvider.ensureRemoteConfigsLoaded()
-    val poBundle = poTokenGenerator.getOrGenerate(forceRefresh = forcePoToken)
+    val poBundle =
+      poTokenGenerator.getOrGenerateWithRealVisitor(
+        httpClient = httpClient,
+        forceRefresh = forcePoToken,
+        allowNetworkVisitorFetch = customPlayerBaseUrl == null,
+      )
     val baseSts = cipherProvider.latestKnownSts()
     val rankedProfiles = profiler.rankedClients(InnerTubeClientType.CASCADE_ORDER)
 
@@ -142,8 +146,8 @@ class InnerTubeXResolver(
           continue
         }
 
-        // Resolve player cipher config if any adaptive format requires signatureCipher decoding
-        val cipherCfg = resolveCipherConfigIfNeeded(trackId, root, baseSts)
+        // Resolve player cipher config lazily only if adaptive formats require signatureCipher decoding
+        val cipherCfg = resolveCipherConfigIfNeeded(trackId, root, baseSts, httpClient, cipherProvider)
         val now = clock()
         val (candidates, loudness) =
           InnerTubeResponseParser.extractFormats(
@@ -184,52 +188,58 @@ class InnerTubeXResolver(
     return null
   }
 
-  private suspend fun resolveCipherConfigIfNeeded(
-    trackId: String,
-    root: JSONObject,
-    fallbackSts: Int,
-  ): PlayerCipherConfig? {
-    val formats = root.optJSONObject("streamingData")?.optJSONArray("adaptiveFormats") ?: return null
-    var needsCipher = false
-    for (i in 0 until formats.length()) {
-      val item = formats.optJSONObject(i) ?: continue
-      if (item.has("signatureCipher") || item.has("cipher")) {
-        needsCipher = true
-        break
-      }
-    }
-    if (!needsCipher) return null
-
-    val playerUrl =
-      root.optJSONObject("playerConfig")?.optString("jsUrl", "")
-        ?.ifBlank { root.optJSONObject("responseContext")?.optString("serviceTrackingParams", "") }
-        .orEmpty()
-    if (playerUrl.contains("/s/player/")) {
-      cipherProvider.fetchOrParseFromPlayerJs(playerUrl)?.let { return it }
-    }
-    return try {
-      val embedHtml =
-        httpClient.getTextWithHeadersSuspend(
-          "https://www.youtube.com/embed/$trackId",
-          mapOf(OkHttpStreamClient.HEADER_ALLOW_HTML to "1"),
-        )
-      val jsPath =
-        Regex("(/s/player/[a-zA-Z0-9_-]+/[^\"'\\\\\\s]+base\\.js)")
-          .find(embedHtml)
-          ?.groupValues
-          ?.getOrNull(1)
-      if (!jsPath.isNullOrBlank()) {
-        cipherProvider.fetchOrParseFromPlayerJs(jsPath)
-      } else {
-        null
-      }
-    } catch (_: Exception) {
-      PlayerCipherConfig(playerId = "sts_$fallbackSts", signatureTimestamp = fallbackSts, sigSteps = emptyList())
-    }
-  }
-
   companion object {
     private const val TAG = "InnerTubeXResolver"
+
+    internal suspend fun resolveCipherConfigIfNeeded(
+      trackId: String,
+      root: JSONObject,
+      fallbackSts: Int,
+      httpClient: StreamHttpClient,
+      cipherProvider: CipherConfigProvider,
+    ): PlayerCipherConfig? {
+      val formats = root.optJSONObject("streamingData")?.optJSONArray("adaptiveFormats") ?: return null
+      var needsCipher = false
+      for (i in 0 until formats.length()) {
+        val item = formats.optJSONObject(i) ?: continue
+        if (item.has("signatureCipher") || item.has("cipher")) {
+          needsCipher = true
+          break
+        }
+      }
+      if (!needsCipher) return null
+
+      cipherProvider.ensureRemoteConfigsLoaded()
+      val playerUrl =
+        root.optJSONObject("playerConfig")?.optString("jsUrl", "")
+          ?.ifBlank { root.optJSONObject("responseContext")?.optString("serviceTrackingParams", "") }
+          .orEmpty()
+      if (playerUrl.contains("/s/player/")) {
+        cipherProvider.fetchOrParseFromPlayerJs(playerUrl)?.let { return it }
+      }
+      return try {
+        val embedHtml =
+          httpClient.getTextWithHeadersSuspend(
+            "https://www.youtube.com/embed/$trackId",
+            mapOf(
+              OkHttpStreamClient.HEADER_ALLOW_HTML to "1",
+              "Cookie" to "CONSENT=YES+cb.20210328-17-p0.en+FX+917; SOCS=CAI",
+            ),
+          )
+        val jsPath =
+          Regex("(/s/player/[a-zA-Z0-9_-]+/[^\"'\\\\\\s]+base\\.js)")
+            .find(embedHtml)
+            ?.groupValues
+            ?.getOrNull(1)
+        if (!jsPath.isNullOrBlank()) {
+          cipherProvider.fetchOrParseFromPlayerJs(jsPath)
+        } else {
+          null
+        }
+      } catch (_: Exception) {
+        PlayerCipherConfig(playerId = "sts_$fallbackSts", signatureTimestamp = fallbackSts, sigSteps = emptyList())
+      }
+    }
   }
 }
 
@@ -250,7 +260,12 @@ class InnerTubeCascadeResolver(
     quality: String,
     forcePoToken: Boolean = false,
   ): ResolvedStream? {
-    val poBundle = poTokenGenerator.getOrGenerate(forceRefresh = forcePoToken)
+    val poBundle =
+      poTokenGenerator.getOrGenerateWithRealVisitor(
+        httpClient = httpClient,
+        forceRefresh = forcePoToken,
+        allowNetworkVisitorFetch = customPlayerBaseUrl == null,
+      )
     val sts = cipherProvider.latestKnownSts()
 
     for (client in InnerTubeClientType.CASCADE_ORDER) {
@@ -274,12 +289,7 @@ class InnerTubeCascadeResolver(
         if (!InnerTubeResponseParser.isPlayableStatus(root)) continue
 
         val cipherCfg =
-          if (client.requiresCipherOrSts) {
-            cipherProvider.getRemoteConfig("default")
-              ?: PlayerCipherConfig("sts_$sts", sts, emptyList())
-          } else {
-            null
-          }
+          InnerTubeXResolver.resolveCipherConfigIfNeeded(trackId, root, sts, httpClient, cipherProvider)
         val now = clock()
         val (candidates, loudness) =
           InnerTubeResponseParser.extractFormats(

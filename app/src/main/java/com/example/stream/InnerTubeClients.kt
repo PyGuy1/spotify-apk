@@ -18,6 +18,7 @@ enum class InnerTubeClientType(
   val requiresCipherOrSts: Boolean = false,
   val supportsPoToken: Boolean = true,
   val isEmbeddedContext: Boolean = false,
+  val isNativeClient: Boolean = false,
 ) {
   WEB_REMIX(
     profileId = "WEB_REMIX",
@@ -60,6 +61,7 @@ enum class InnerTubeClientType(
     androidSdkVersion = 32,
     requiresCipherOrSts = false,
     supportsPoToken = true,
+    isNativeClient = true,
   ),
   TVHTML5(
     profileId = "TVHTML5",
@@ -88,6 +90,7 @@ enum class InnerTubeClientType(
     androidSdkVersion = 32,
     requiresCipherOrSts = false,
     supportsPoToken = true,
+    isNativeClient = true,
   ),
   WEB_CREATOR(
     profileId = "WEB_CREATOR",
@@ -114,6 +117,7 @@ enum class InnerTubeClientType(
     osVersion = "18.3.2.22D82",
     requiresCipherOrSts = false,
     supportsPoToken = true,
+    isNativeClient = true,
   ),
   IOS(
     profileId = "IOS",
@@ -129,6 +133,7 @@ enum class InnerTubeClientType(
     osVersion = "18.3.2.22D82",
     requiresCipherOrSts = false,
     supportsPoToken = true,
+    isNativeClient = true,
   );
 
   fun playerEndpointUrl(): String =
@@ -138,14 +143,18 @@ enum class InnerTubeClientType(
     }
 
   fun buildHeaders(visitorData: String): Map<String, String> =
-    linkedMapOf(
-      "User-Agent" to userAgent,
-      "Origin" to originUrl,
-      "Referer" to "$originUrl/",
-      "X-YouTube-Client-Name" to clientHeaderId,
-      "X-YouTube-Client-Version" to clientVersion,
-      "X-Goog-Visitor-Id" to visitorData,
-    )
+    linkedMapOf<String, String>().apply {
+      put("User-Agent", userAgent)
+      if (!isNativeClient) {
+        put("Origin", originUrl)
+        put("Referer", "$originUrl/")
+      }
+      put("X-YouTube-Client-Name", clientHeaderId)
+      put("X-YouTube-Client-Version", clientVersion)
+      if (visitorData.isNotBlank()) {
+        put("X-Goog-Visitor-Id", visitorData)
+      }
+    }
 
   fun buildPlayerPayload(
     videoId: String,
@@ -159,7 +168,9 @@ enum class InnerTubeClientType(
         put("clientVersion", clientVersion)
         put("hl", "en")
         put("gl", "US")
-        put("visitorData", poTokenBundle.visitorData)
+        if (poTokenBundle.visitorData.isNotBlank()) {
+          put("visitorData", poTokenBundle.visitorData)
+        }
         deviceMake?.let { put("deviceMake", it) }
         deviceModel?.let { put("deviceModel", it) }
         osName?.let { put("osName", it) }
@@ -184,16 +195,18 @@ enum class InnerTubeClientType(
         put("videoId", videoId)
         put("contentCheckOk", true)
         put("racyCheckOk", true)
-        put(
-          "playbackContext",
-          JSONObject().put(
-            "contentPlaybackContext",
-            JSONObject().apply {
-              put("signatureTimestamp", signatureTimestamp)
-              put("html5Preference", "HTML5_PREF_WANTS")
-            },
-          ),
-        )
+        if (!isNativeClient || requiresCipherOrSts) {
+          put(
+            "playbackContext",
+            JSONObject().put(
+              "contentPlaybackContext",
+              JSONObject().apply {
+                put("signatureTimestamp", signatureTimestamp)
+                put("html5Preference", "HTML5_PREF_WANTS")
+              },
+            ),
+          )
+        }
         if (includePoToken && supportsPoToken) {
           put(
             "serviceIntegrityDimensions",

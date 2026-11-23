@@ -671,7 +671,6 @@ class StreamResolver(
         "https://yewtu.be",
         "https://inv.nadeko.net",
         "https://invidious.nerdvpn.de",
-        "https://invidious.privacyredirect.com",
       )
 
     fun normalizeQuality(quality: String): String =

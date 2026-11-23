@@ -118,6 +118,7 @@ class PulsePlaybackService : MediaSessionService() {
         qualityProvider = { null },
         okHttpClient = runtime.okHttpClient,
         trackMetadataProvider = { id -> queueTrackMap[id] },
+        networkAvailableProvider = { PulseRuntime.isNetworkAvailable(this) },
       )
     val cachingDataSourceFactory =
       runtime.cacheModule.createPlaybackDataSourceFactory(upstreamFactory)
@@ -297,7 +298,9 @@ class PulsePlaybackService : MediaSessionService() {
             recoveryAttemptsForTrack = 0
           }
           val isPureLocal = track.id.startsWith("local_")
-          if (!isPureLocal && recoveryAttemptsForTrack < 2) {
+          val offlineNetworkError =
+            diag.category == PulseFailureCategory.NETWORK && !PulseRuntime.isNetworkAvailable(this@PulsePlaybackService)
+          if (!isPureLocal && !offlineNetworkError && recoveryAttemptsForTrack < 2) {
             recoveryAttemptsForTrack++
             val resumePos = player.currentPosition.coerceAtLeast(0L)
             lastErrorMessage =

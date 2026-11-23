@@ -73,6 +73,7 @@ class PulseMediaDataSource(
   private val qualityProvider: () -> String?,
   private val okHttpClient: OkHttpClient,
   private val trackMetadataProvider: (String) -> PulseTrack? = { null },
+  private val networkAvailableProvider: () -> Boolean = { true },
 ) : BaseDataSource(/* isNetwork = */ true) {
 
   private var activeHttpStream: ActiveHttpStream? = null
@@ -176,14 +177,25 @@ class PulseMediaDataSource(
   }
 
   private fun openRemoteWithFailover(trackId: String, dataSpec: DataSpec): Long {
+    if (!networkAvailableProvider()) {
+      throw PulseSourceException(
+        PulseFailureCategory.NETWORK,
+        "No internet connection. Download songs for offline playback.",
+        "Offline: no active network connection for $trackId",
+      )
+    }
     val explicitQuality = qualityProvider()
     val effectiveQuality = streamResolver.networkQualityManager.effectiveQuality(explicitQuality)
     val pinKey = "$trackId|$effectiveQuality|${streamResolver.getEngineMode().wireName}"
     val trackModel = trackMetadataProvider(trackId) ?: PulseTrack(id = trackId, title = trackId)
     val tried = HashSet<String>()
     var lastException: PulseSourceException? = null
+    var primaryNonProxyException: PulseSourceException? = null
+    val dnsFailedHosts = HashSet<String>()
+    var nonDnsFailureCount = 0
 
     for (attemptRound in 0..1) {
+      if (attemptRound > 0 && !networkAvailableProvider()) break
       val candidates = mutableListOf<AudioCandidate>()
       if (attemptRound == 0) {
         pinnedCandidates[pinKey]?.let { candidates.add(it) }
@@ -238,7 +250,8 @@ class PulseMediaDataSource(
       }
 
       if (candidates.isEmpty() && attemptRound == 1) {
-        throw lastException
+        throw primaryNonProxyException
+          ?: lastException
           ?: PulseSourceException(
             PulseFailureCategory.RESOLVE,
             "Unable to resolve audio stream.",
@@ -262,6 +275,14 @@ class PulseMediaDataSource(
           throw e
         } catch (e: PulseSourceException) {
           lastException = e
+          if (candidate.engineSource != "piped-fallback") {
+            primaryNonProxyException = e
+          }
+          if (e.cause is UnknownHostException) {
+            dnsFailedHosts.add(candidate.sourceHost)
+          } else {
+            nonDnsFailureCount++
+          }
           if (pinnedCandidates[pinKey]?.url == candidate.url) {
             pinnedCandidates.remove(pinKey)
           }
@@ -272,9 +293,19 @@ class PulseMediaDataSource(
           )
         }
       }
+
+      if (attemptRound == 0 && dnsFailedHosts.size >= 2 && nonDnsFailureCount == 0) {
+        throw PulseSourceException(
+          PulseFailureCategory.NETWORK,
+          "No internet connection or streaming servers unreachable.",
+          "DNS failed across ${dnsFailedHosts.size} hosts (${dnsFailedHosts.joinToString()}) for $trackId",
+          lastException?.cause,
+        )
+      }
     }
 
-    throw lastException
+    throw primaryNonProxyException
+      ?: lastException
       ?: PulseSourceException(
         PulseFailureCategory.RESOLVE,
         "Unable to resolve audio stream.",
@@ -600,6 +631,7 @@ class PulseMediaDataSource(
     private val qualityProvider: () -> String?,
     private val okHttpClient: OkHttpClient,
     private val trackMetadataProvider: (String) -> PulseTrack? = { null },
+    private val networkAvailableProvider: () -> Boolean = { true },
   ) : DataSource.Factory {
     override fun createDataSource(): DataSource =
       PulseMediaDataSource(
@@ -609,6 +641,7 @@ class PulseMediaDataSource(
         qualityProvider = qualityProvider,
         okHttpClient = okHttpClient,
         trackMetadataProvider = trackMetadataProvider,
+        networkAvailableProvider = networkAvailableProvider,
       )
   }
 

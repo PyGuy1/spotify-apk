@@ -28,6 +28,9 @@ class PoTokenGenerator(
   @Volatile private var cachedBundle: PoTokenBundle? = null
   @Volatile private var overridePoToken: String = ""
   @Volatile private var overrideVisitorData: String = ""
+  @Volatile private var realVisitorData: String = ""
+  @Volatile private var realVisitorFetchedAtMs: Long = 0L
+  @Volatile private var lastVisitorFetchAttemptMs: Long = 0L
 
   fun setManualOverride(poToken: String, visitorData: String = "") {
     overridePoToken = poToken.trim()
@@ -35,11 +38,55 @@ class PoTokenGenerator(
     cachedBundle = null
   }
 
+  suspend fun getOrGenerateWithRealVisitor(
+    httpClient: StreamHttpClient,
+    forceRefresh: Boolean = false,
+    allowNetworkVisitorFetch: Boolean = true,
+  ): PoTokenBundle {
+    if (allowNetworkVisitorFetch && overrideVisitorData.isBlank()) {
+      ensureRealVisitorData(httpClient)
+    }
+    return getOrGenerate(forceRefresh)
+  }
+
+  private suspend fun ensureRealVisitorData(httpClient: StreamHttpClient) {
+    val now = clock()
+    if (realVisitorData.isNotBlank() && now - realVisitorFetchedAtMs < PoTokenBundle.DEFAULT_TTL_MS) {
+      return
+    }
+    if (lastVisitorFetchAttemptMs > 0L && now - lastVisitorFetchAttemptMs < VISITOR_FAILURE_COOLDOWN_MS) {
+      return
+    }
+    lastVisitorFetchAttemptMs = now
+    val payload =
+      """{"context":{"client":{"clientName":"WEB","clientVersion":"2.20250312.04.00","hl":"en","gl":"US"}}}"""
+    val urls =
+      listOf(
+        "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false",
+        "https://music.youtube.com/youtubei/v1/visitor_id?prettyPrint=false",
+      )
+    for (url in urls) {
+      try {
+        val raw = httpClient.postJsonSuspend(url, payload, mapOf("Origin" to "https://www.youtube.com"))
+        val vd = JSONObject(raw).optJSONObject("responseContext")?.optString("visitorData", "").orEmpty().trim()
+        if (vd.isNotBlank()) {
+          realVisitorData = vd
+          realVisitorFetchedAtMs = clock()
+          cachedBundle = null
+          return
+        }
+      } catch (_: Exception) {}
+    }
+  }
+
   fun getOrGenerate(forceRefresh: Boolean = false): PoTokenBundle {
     val now = clock()
     if (overridePoToken.isNotBlank()) {
       return PoTokenBundle(
-        visitorData = overrideVisitorData.ifBlank { synthesizeVisitorData(now) },
+        visitorData =
+          overrideVisitorData.ifBlank {
+            realVisitorData.ifBlank { synthesizeVisitorData(now) }
+          },
         poToken = overridePoToken,
         generatedAtMs = now,
       )
@@ -53,10 +100,17 @@ class PoTokenGenerator(
       if (!forceRefresh && again != null && !again.isExpired(now)) {
         return again
       }
-      val visitor = overrideVisitorData.ifBlank { synthesizeVisitorData(now) }
+      val visitor =
+        overrideVisitorData.ifBlank {
+          realVisitorData.ifBlank { synthesizeVisitorData(now) }
+        }
       val token = synthesizePoToken(visitor, now)
       return PoTokenBundle(visitor, token, now).also { cachedBundle = it }
     }
+  }
+
+  companion object {
+    private const val VISITOR_FAILURE_COOLDOWN_MS = 5 * 60 * 1000L
   }
 
   private fun synthesizeVisitorData(nowMs: Long): String {
@@ -123,6 +177,7 @@ class CipherConfigProvider(
 ) {
   private val configsByPlayerId = ConcurrentHashMap<String, PlayerCipherConfig>()
   @Volatile private var remoteConfigsLoadedAtMs: Long = 0L
+  @Volatile private var lastRemoteAttemptMs: Long = 0L
 
   suspend fun getRemoteConfig(playerId: String): PlayerCipherConfig? {
     configsByPlayerId[playerId]?.let { return it }
@@ -146,6 +201,10 @@ class CipherConfigProvider(
     ) {
       return
     }
+    if (!forceRefresh && lastRemoteAttemptMs > 0L && now - lastRemoteAttemptMs < REMOTE_FAILURE_COOLDOWN_MS) {
+      return
+    }
+    lastRemoteAttemptMs = now
     for (url in remoteConfigUrls) {
       try {
         val raw = httpClient.getTextSuspend(url)
@@ -289,6 +348,7 @@ class CipherConfigProvider(
     private const val TAG = "CipherConfigProvider"
     const val FALLBACK_STS = 20073
     const val REMOTE_CONFIG_TTL_MS = 6 * 60 * 60 * 1000L
+    const val REMOTE_FAILURE_COOLDOWN_MS = 5 * 60 * 1000L
 
     val DEFAULT_REMOTE_CONFIG_URLS =
       listOf(
@@ -307,12 +367,14 @@ class CipherConfigProvider(
         ?.toIntOrNull()
 
     fun extractCipherOpsFromJs(playerJs: String): List<CipherStep> {
-      // Locate main decipher function pattern: a=a.split(""); <obj>.<fn>(a,N); ... return a.join("")
+      // Locate main decipher function pattern: p=p.split(""); <obj>.<fn>(p,N); ... return p.join("")
       val mainFnRegex =
-        Regex("=function\\(a\\)\\{a=a\\.split\\([\"']{2}\\);(.*?)return a\\.join\\([\"']{2}\\)\\}")
-      val body = mainFnRegex.find(playerJs)?.groupValues?.getOrNull(1) ?: return emptyList()
+        Regex("=function\\(([\\w$]+)\\)\\{\\1=\\1\\.split\\([\"']{2}\\);(.*?)return \\1\\.join\\([\"']{2}\\)\\}")
+      val mainMatch = mainFnRegex.find(playerJs) ?: return emptyList()
+      val paramName = Regex.escape(mainMatch.groupValues[1])
+      val body = mainMatch.groupValues[2]
 
-      val calls = Regex("([\\w$]+)\\.([\\w$]+)\\(a(?:\\s*,\\s*(\\d+))?\\)").findAll(body).toList()
+      val calls = Regex("([\\w$]+)\\.([\\w$]+)\\($paramName(?:\\s*,\\s*(\\d+))?\\)").findAll(body).toList()
       if (calls.isEmpty()) return emptyList()
 
       val helperObjName = calls.first().groupValues[1]

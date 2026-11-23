@@ -19,6 +19,7 @@ import com.example.stream.NetworkTransportKind
 import com.example.stream.OkHttpStreamClient
 import com.example.stream.PipedFallbackConstants
 import com.example.stream.PlayerCipherConfig
+import com.example.stream.PoTokenBundle
 import com.example.stream.PoTokenGenerator
 import com.example.stream.ResolvedStream
 import com.example.stream.SelfHostedAudioResolver
@@ -532,5 +533,82 @@ class PyMusicStreamingAndDownloadTest {
       server.stop(0)
       tempDir.deleteRecursively()
     }
+  }
+
+  @Test
+  fun hardenedExtraction_nativeHeadersRealVisitorEscapedEmbedAndNoDeadInvidious() = runBlocking {
+    // 1. Dead Invidious host must not remain in default pool
+    assertFalse(
+      StreamResolver.DEFAULT_INVIDIOUS.any { it.contains("invidious.privacyredirect.com") }
+    )
+
+    // 2. Native clients omit Origin/Referer & HTML5_PREF_WANTS while web clients keep them
+    val vrHeaders = InnerTubeClientType.ANDROID_VR_1_65_10.buildHeaders("REAL_VISITOR_1")
+    assertFalse(vrHeaders.containsKey("Origin"))
+    assertFalse(vrHeaders.containsKey("Referer"))
+    val vrPayload =
+      JSONObject(
+        InnerTubeClientType.ANDROID_VR_1_65_10.buildPlayerPayload(
+          videoId = "QEbuK846Raw",
+          poTokenBundle = PoTokenBundle("REAL_VISITOR_1", "pot", 1_000L),
+          signatureTimestamp = 20073,
+          includePoToken = false,
+        )
+      )
+    assertFalse(vrPayload.has("playbackContext"))
+
+    val webHeaders = InnerTubeClientType.WEB_REMIX.buildHeaders("REAL_VISITOR_1")
+    assertTrue(webHeaders.containsKey("Origin"))
+    val webPayload =
+      JSONObject(
+        InnerTubeClientType.WEB_REMIX.buildPlayerPayload(
+          videoId = "QEbuK846Raw",
+          poTokenBundle = PoTokenBundle("REAL_VISITOR_1", "pot", 1_000L),
+          signatureTimestamp = 20073,
+          includePoToken = false,
+        )
+      )
+    assertTrue(webPayload.has("playbackContext"))
+
+    // 3. Real visitorData fetched once and cached
+    val visitorCalls = AtomicInteger(0)
+    val http =
+      object : StreamHttpClient {
+        override fun getText(url: String): String = ""
+        override suspend fun postJsonSuspend(
+          url: String,
+          jsonBody: String,
+          headers: Map<String, String>,
+        ): String {
+          if (url.contains("visitor_id")) {
+            visitorCalls.incrementAndGet()
+            return """{"responseContext":{"visitorData":"CgtSRV9WSVNJVE9SXzE"}}"""
+          }
+          throw IOException("Unexpected $url")
+        }
+      }
+    val poGen = PoTokenGenerator(clock = { 100_000L })
+    val b1 = poGen.getOrGenerateWithRealVisitor(http)
+    val b2 = poGen.getOrGenerateWithRealVisitor(http)
+    assertEquals("CgtSRV9WSVNJVE9SXzE", b1.visitorData)
+    assertEquals("CgtSRV9WSVNJVE9SXzE", b2.visitorData)
+    assertEquals(1, visitorCalls.get())
+
+    // 4. General JS parameter decipher (not hardcoded 'a') + escaped embed playerResponse
+    val js =
+      """
+      var helperObj={rv:function(x){x.reverse()},sp:function(x,b){x.splice(0,b)}};
+      var dec=function(sig){sig=sig.split("");helperObj.rv(sig);helperObj.sp(sig,1);return sig.join("")};
+      """.trimIndent()
+    val steps = CipherConfigProvider.extractCipherOpsFromJs(js)
+    assertEquals(listOf(CipherStep.Reverse, CipherStep.Splice(1)), steps)
+    assertEquals("DCBA", CipherDeobfuscator.applyCipherSteps("ABCDE", steps))
+
+    val innerJson = validPlayerJson("https://cdn.example/videoplayback?itag=251", 251)
+    val escaped = innerJson.replace("\\", "\\\\").replace("\"", "\\\"")
+    val embedHtml = """<script>var cfg={"playerResponse":"$escaped"};</script>"""
+    val extracted = BravePipeExtractor.extractPlayerResponseJson(embedHtml)
+    assertNotNull(extracted)
+    assertTrue(JSONObject(extracted!!).has("streamingData"))
   }
 }

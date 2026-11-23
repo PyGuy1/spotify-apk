@@ -34,6 +34,7 @@ class BravePipeExtractor(
               "User-Agent" to
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
               "Accept-Language" to "en-US,en;q=0.9",
+              "Cookie" to "CONSENT=YES+cb.20210328-17-p0.en+FX+917; SOCS=CAI",
             ),
           )
         val playerJson = extractPlayerResponseJson(html) ?: continue
@@ -152,13 +153,59 @@ class BravePipeExtractor(
           "ytInitialPlayerResponse = ",
           "ytInitialPlayerResponse=",
           "\"PLAYER_RESPONSE\":",
+          "\"playerResponse\":",
         )
       for (marker in markers) {
         val idx = html.indexOf(marker)
         if (idx < 0) continue
-        val braceStart = html.indexOf('{', idx + marker.length)
-        if (braceStart < 0) continue
-        extractBalancedJsonObject(html, braceStart)?.let { return it }
+        var pos = idx + marker.length
+        while (pos < html.length && html[pos].isWhitespace()) pos++
+        if (pos >= html.length) continue
+        if (html[pos] == '"') {
+          extractJsonStringLiteral(html, pos)?.let { unescaped ->
+            if (unescaped.trimStart().startsWith("{")) return unescaped
+          }
+        } else {
+          val braceStart = html.indexOf('{', pos)
+          if (braceStart >= 0) {
+            extractBalancedJsonObject(html, braceStart)?.let { return it }
+          }
+        }
+      }
+      return null
+    }
+
+    private fun extractJsonStringLiteral(source: String, quoteIndex: Int): String? {
+      val sb = StringBuilder()
+      var i = quoteIndex + 1
+      var escaped = false
+      while (i < source.length) {
+        val ch = source[i++]
+        if (escaped) {
+          when (ch) {
+            'n' -> sb.append('\n')
+            'r' -> sb.append('\r')
+            't' -> sb.append('\t')
+            '\\', '"', '/' -> sb.append(ch)
+            'u' -> {
+              if (i + 4 <= source.length) {
+                val hex = source.substring(i, i + 4).toIntOrNull(16)
+                if (hex != null) {
+                  sb.append(hex.toChar())
+                  i += 4
+                }
+              }
+            }
+            else -> sb.append(ch)
+          }
+          escaped = false
+        } else if (ch == '\\') {
+          escaped = true
+        } else if (ch == '"') {
+          return sb.toString()
+        } else {
+          sb.append(ch)
+        }
       }
       return null
     }
