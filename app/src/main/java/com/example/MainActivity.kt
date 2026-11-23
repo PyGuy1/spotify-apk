@@ -190,6 +190,7 @@ class MainActivity : ComponentActivity() {
               onCanGoBackChanged = { canGoBack = it },
             ).also { created ->
               webView = created
+              pulseBridge.lastKnownMainFrameUrl = APP_ENTRY_URL
               created.loadUrl(APP_ENTRY_URL)
             }
           },
@@ -296,6 +297,15 @@ class MainActivity : ComponentActivity() {
           override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
             super.doUpdateVisitedHistory(view, url, isReload)
             onCanGoBackChanged(view?.canGoBack() == true)
+          }
+
+          override fun onPageStarted(
+            view: WebView?,
+            url: String?,
+            favicon: android.graphics.Bitmap?,
+          ) {
+            super.onPageStarted(view, url, favicon)
+            pulseBridge.lastKnownMainFrameUrl = url.orEmpty()
           }
 
           override fun onPageFinished(view: WebView?, url: String?) {

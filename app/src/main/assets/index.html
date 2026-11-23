@@ -587,7 +587,7 @@ async function discover(){
   let piped=[],inv=[];
   try{const d=await getJSON('https://piped-instances.kavin.rocks/');piped=d.filter(x=>x.api_url&&(x.uptime_30d==null||x.uptime_30d>50)).sort((a,b)=>(b.uptime_30d||0)-(a.uptime_30d||0)).map(x=>x.api_url.replace(/\/$/,''))}catch{}
   try{const d=await getJSON('https://api.invidious.io/instances.json?sort_by=type,health');inv=d.filter(x=>x[1]&&x[1].type==='https'&&x[1].api&&x[1].cors).map(x=>x[1].uri.replace(/\/$/,''))}catch{}
-  if(piped.length||inv.length){const r={t:Date.now(),piped:[...new Set([...piped.slice(0,3),...PIPED,...piped.slice(3,9)])],inv:[...new Set([...inv.slice(0,3),...INV,...inv.slice(3,9)])]};Object.assign(SRC,r);store.set('inst',r)}
+  if(piped.length||inv.length){const r={t:Date.now(),piped:[...new Set([...piped.slice(0,3),...PIPED,...piped.slice(3,9)])],inv:[...new Set([...inv.slice(0,3),...INV,...inv.slice(3,9)])]};Object.assign(SRC,r);store.set('inst',r);if(NB&&typeof NB.setDiscoveredMirrors==='function')NB.setDiscoveredMirrors(JSON.stringify(SRC.piped||[]),JSON.stringify(SRC.inv||[]))}
 }
 const NOISE=/ - Topic$/,ARTTH={};   // ARTTH: artist -> a cover we have seen (fallback artist picture)
 function norm(d,ms){
@@ -1101,6 +1101,11 @@ function play(tracks,i,rm){
   if(!mapped.length)return;
   queue=mapped;idx=rm?0:Math.max(0,Math.min(i,mapped.length-1));radioMode=!!rm;qgen++;fillP=null;shufSnap=null;restored=false;pendingSeek=0;
   if(NB){
+    const curTrack=queue[idx];
+    if(curTrack&&!curTrack.localUri&&typeof NB.seedPreResolvedStream==='function'){
+      const ce=cache['st'+curTrack.id];
+      if(ce&&ce.p)ce.p.then(info=>{if(info&&info.audio)NB.seedPreResolvedStream(curTrack.id,store.get('aq','normal'),JSON.stringify([info.audio,...(info.alts||[])].filter(Boolean)))}).catch(()=>{});
+    }
     ui('busy');paintNow(queue[idx]);updNav();refreshQueue();saveSess();
     NB.playQueue(JSON.stringify(queue),idx,0,radioMode);
     if(rm)fillQueue(30,true);else topUp();
@@ -1142,7 +1147,10 @@ function prev(){
 }
 function toggle(){
   if(!queue.length)return;
-  if(NB){NB.toggle();return}
+  if(NB){
+    if(restored){restored=false;NB.playQueue(JSON.stringify(queue.map(attachLocal)),idx,resumeAt||0,radioMode);return}
+    NB.toggle();return
+  }
   if(restored){restored=false;pendingSeek=resumeAt;load();return}
   if(ePlaying()){wantPlay=false;ePause()}else{wantPlay=true;ePlay()}
 }
@@ -1178,7 +1186,7 @@ if(!NB){
 }
 
 /* remember the session */
-const slim=t=>({id:t.id,title:t.title,artist:t.artist,duration:t.duration,thumb:t.thumb,tp:t.tp,v:t.v,ms:t.ms,uq:t.uq,auto:t.auto,pn:t.pn,localUri:t.localUri});
+const slim=t=>({id:t.id,title:t.title,artist:t.artist,album:t.album,duration:t.duration,thumb:t.thumb,tp:t.tp,v:t.v,ms:t.ms,uq:t.uq,auto:t.auto,pn:t.pn,localUri:t.localUri,sourceType:t.sourceType,streamUrl:t.streamUrl});
 function saveSess(){if(!queue.length)return;const a=Math.max(0,idx-120),b=Math.min(queue.length,idx+180);store.set('sess',{q:queue.slice(a,b).map(slim),i:idx-a,rm:radioMode,t:eCur()})}
 setInterval(()=>{if(queue.length&&ePlaying()){const s=store.get('sess',null);if(s){s.t=eCur();store.set('sess',s)}}},5000);
 
@@ -1211,6 +1219,9 @@ window.__pulseNativeEvent=function(type,payload){
       if($('#res')&&view!=='home')paint(list,'');
       topUp();
     }
+    if(typeof payload.engineMode==='string')store.set('eng',payload.engineMode);
+    if(typeof payload.wifiQuality==='string')store.set('waq',payload.wifiQuality);
+    if(typeof payload.cellularQuality==='string')store.set('caq',payload.cellularQuality);
     if(payload.error&&payload.error!==nativeState.err){nativeState.err=payload.error;toast(payload.error)}
     else if(!payload.error)nativeState.err='';
     ui(nativeState.buffering?'busy':nativeState.playing?'pause':'play');
@@ -1220,7 +1231,7 @@ window.__pulseNativeEvent=function(type,payload){
   }else if(type==='download'){
     if(payload&&payload.id){
       dlStates[payload.id]=payload;
-      if(payload.status==='completed')toast('Saved to Music/Pulse: '+(payload.fileName||(payload.track&&payload.track.title)||'Song'));
+      if(payload.status==='completed')toast('Saved to Music/PyMusic: '+(payload.fileName||(payload.track&&payload.track.title)||'Song'));
       else if(payload.status==='failed')toast(payload.error||'Download failed');
       else if(payload.status==='cancelled')toast('Download cancelled');
       if(view==='downloaded')paintDownloadedProgress();
@@ -1404,12 +1415,16 @@ async function downloadSong(t){
     const dlSt=dlStates[t.id];
     if(dlSt&&(dlSt.status==='queued'||dlSt.status==='resolving'||dlSt.status==='downloading')){toast('Download already in progress');return}
     toast('Starting download…');
-    let info=null;try{info=await getStream(t.id)}catch{}
-    const itag=store.get('aq','normal')==='low'?139:140;
-    const cand=[],seen=new Set(),push=u=>{if(u&&!seen.has(u)){seen.add(u);cand.push(u)}};
-    if(info){push(info.audio);(info.alts||[]).forEach(push)}
-    ranked(SRC.inv,5).forEach(h=>push(`${h}/latest_version?id=${t.id}&itag=${itag}&local=true`));
-    NB.downloadSong(JSON.stringify(slim(t)),JSON.stringify(cand));
+    const payload=slim(t);
+    try{
+      if(lyrCache[t.id]){
+        const lr=await Promise.race([lyrCache[t.id],sleep(200).then(()=>null)]);
+        if(lr&&Array.isArray(lr.lines)&&lr.lines.length){
+          payload.lyrics=lr.lines.map(x=>x.t||x.text||'').filter(Boolean).join('\n');
+        }
+      }
+    }catch{}
+    NB.downloadSong(JSON.stringify(payload),'[]');
     return;
   }
   toast('Preparing download…');
@@ -1763,7 +1778,7 @@ function renderPlaylist(m){
   if(isD&&NB)NB.syncDownloadedLibrary();
   const tracks=plTracks(name);list=tracks;
   const dm=Math.round(tracks.reduce((a,t)=>a+(t.duration||0),0)/60),dur=dm?` · ${dm>=60?Math.floor(dm/60)+' hr '+(dm%60)+' min':dm+' min'}`:'';
-  m.innerHTML=`<div class="hero"><div class="hcov">${coverHTML(name)}</div><div class="hmeta"><div class="a">${isD?'FOLDER · MUSIC/PULSE':'PLAYLIST'}</div><h1>${esc(name)}</h1><div class="a">${tracks.length} song${tracks.length===1?'':'s'}${dur}</div></div></div>
+  m.innerHTML=`<div class="hero"><div class="hcov">${coverHTML(name)}</div><div class="hmeta"><div class="a">${isD?'FOLDER · MUSIC/PYMUSIC':'PLAYLIST'}</div><h1>${esc(name)}</h1><div class="a">${tracks.length} song${tracks.length===1?'':'s'}${dur}</div></div></div>
   <div class="chips"><button class="chip pri" id="playall">${ic('play')}Play</button><button class="chip" id="shufpl">${ic('shuffle')}Shuffle</button>${isL||isD?'':`<button class="chip" id="editpl">${ic('edit')}Edit</button>`}${isD&&NB?`<button class="chip" id="impAudioBtn">${ic('import')}Add audio</button><button class="chip" id="syncDlBtn">${ic('refresh')}Refresh</button>`:''}<button class="chip" id="expb">${ic('export')}Export</button></div>${isD?'<div id="dlprog"></div>':''}<div id="res"></div>`;
   if(isD)paintDownloadedProgress();
   paint(tracks,isD?'No downloaded songs yet. Tap ⋮ on any song and choose Download song.':'Nothing here yet. Like a song or add one from search.');
@@ -1771,7 +1786,7 @@ function renderPlaylist(m){
   $('#shufpl').onclick=()=>{if(!tracks.length)return;shuffle=true;updNav();play(tracks,Math.floor(Math.random()*tracks.length),false)};
   $('#expb').onclick=()=>sheetExport(name,tracks);
   if($('#impAudioBtn'))$('#impAudioBtn').onclick=()=>NB.importLocalAudio();
-  if($('#syncDlBtn'))$('#syncDlBtn').onclick=()=>{NB.syncDownloadedLibrary();toast('Scanning Music/Pulse…')};
+  if($('#syncDlBtn'))$('#syncDlBtn').onclick=()=>{NB.syncDownloadedLibrary();toast('Scanning Music/PyMusic…')};
   if($('#editpl'))$('#editpl').onclick=()=>sheetEdit(name);
 }
 async function newPlaylist(){
@@ -1859,7 +1874,7 @@ function renderSettings(m){
   const tiles=STY.map(([k,l])=>`<button class="stile${PS.sty===k?' on':''}" data-seg="sty" data-v="${k}" aria-pressed="${PS.sty===k}" aria-label="${l} slider"><div class="sl2 s-${k} pv" style="--p:58%;--wave:${waveSvg('pv'+k)}"><div class="tr"><i class="fl"></i></div><b class="th"></b></div><span>${l}</span></button>`).join('');
   m.innerHTML=`<h1>Settings</h1><div class="sub">Manage your library, playback and how Pulse looks.</div><div class="setg">
   ${CARD('lib','Library','Playlists, imports and backups',SR('import','import','Import playlist','From Spotify, YouTube Music or a file')+SR('export','export','Export playlist','Save as CSV, JSON, TXT or M3U')+SR('backup','export','Back up everything','All playlists and liked songs in one file')+SR('restore','import','Restore backup','Add playlists from a Pulse backup file'))}
-  ${CARD('radio','Playback','Autoplay, quality and background play',SW('auto','radio','Autoplay similar songs','Keep playing songs like the last one when the queue ends',autoplay)+SEG('aq','vol','Audio quality','Lower quality uses less data',[['low','Low'],['normal','Normal'],['high','High']],store.get('aq','normal'))+SR('bgcheck','radio','Background play','Check which music servers are working right now')+SR('sleep','timer','Sleep timer','Stop playback after a set time'))}
+  ${CARD('radio','Playback','Autoplay, quality and background play',SW('auto','radio','Autoplay similar songs','Keep playing songs like the last one when the queue ends',autoplay)+SEG('eng','radio','Streaming engine','Choose extraction priority (Auto, PoToken, BravePipe)',[['auto','Auto'],['potoken','PoToken'],['bravepipe','BravePipe']],store.get('eng','auto'))+SEG('waq','vol','Wi-Fi audio quality','Quality on Wi-Fi / unmetered connections',[['low','Low'],['normal','Normal'],['high','High']],store.get('waq',store.get('aq','high')))+SEG('caq','vol','Cellular audio quality','Quality on mobile data',[['low','Low'],['normal','Normal'],['high','High']],store.get('caq',store.get('aq','normal')))+SR('bgcheck','radio','Background play','Check which music servers are working right now')+SR('sleep','timer','Sleep timer','Stop playback after a set time'))}
   ${CARD('sliders','Player slider','Customise the progress bar',`<div class="sr sprev"><span class="sm"><b>Preview</b><span class="a">Drag to try the style</span></span><div class="sl2" id="slprev" role="slider" tabindex="0" aria-label="Preview" aria-valuemin="0" aria-valuemax="100" aria-valuenow="38"><div class="tr"><i class="fl"></i></div><b class="th"></b><span class="tip">0:00</span></div></div><div class="stiles">${tiles}</div>`
     +SEG('col','image','Colour','Match the song’s cover or use a fixed colour',[['cover','Cover'],['accent','Accent'],['white','White']],PS.col)
     +SEG('hnd','sliders','Handle','Shape of the draggable handle',[['dot','Dot'],['pill','Pill'],['bar','Bar'],['none','None']],PS.hnd)
@@ -1871,7 +1886,7 @@ function renderSettings(m){
   ${CARD('lyrics','Lyrics','Original lyrics and English letters',SEG('lm','lyrics','Default view','What the lyrics panel shows first',[['orig','Original'],['rom','Romanized'],['en','English']],PS.lm||'orig')+SEG('lsz','max','Text size','Size of the lyrics',[['s','Small'],['m','Medium'],['l','Large']],PS.lsz||'m'))}
   ${CARD('globe','Charts','Region used for “Top in …”',SR('country','globe','Country','Used for charts on Home',esc(cname(region()))))}
   ${CARD('image','Appearance','Look and feel',SW('fscol','image','Cover colours in full screen','Tint the player and its 360° halo with colours from the album art',PS.fscol)+SW('rmot','max','Reduce motion','Turn off animations',store.get('rmot',false)))}
-  ${CARD('trash','Data','History, server and reset',SR('clrrec','trash','Clear recently played','Remove your listening history')+SR('clrsrch','clock','Clear search history','Remove recent searches')+SR('server','refresh','Search server','Advanced: use your own Piped server',store.get('source','')?'Custom':'Automatic')+SR('reset','trash','Reset Pulse','Delete playlists, liked songs and history on this device'))}
+  ${CARD('trash','Data','History, server and reset',SR('clrrec','trash','Clear recently played','Remove your listening history')+SR('clrsrch','clock','Clear search history','Remove recent searches')+SR('server','refresh','Search server','Advanced: use your own Piped server',store.get('source','')?'Custom':'Automatic')+SR('selfhosted','lib','Self-hosted server','Jellyfin, Subsonic, or Navidrome',(store.get('sh',{type:'none'}).type||'none')!=='none'?store.get('sh').type:'Off')+SR('reset','trash','Reset Pulse','Delete playlists, liked songs and history on this device'))}
   ${CARD('note','About','Pulse',`<div class="sr"><span class="si">${ic('note')}</span><span class="sm"><b>How it plays</b><span class="a">Songs play from an audio stream, so music keeps going in the background. Playlists and settings are stored on this device.</span></span></div>`)}
   </div><input type="file" id="bakfile" accept=".json,application/json" hidden>`;
   makeSlider($('#slprev'),{max:100,value:38,tip:f=>fmt(f*214)});applyPS();
@@ -1887,6 +1902,9 @@ $('#main').addEventListener('click',async e=>{
   if(sg){const k=sg.dataset.seg,raw=sg.dataset.v,val=k==='skip'?+raw:raw;
     $$('[data-seg="'+k+'"]').forEach(b=>{const on=b===sg;b.classList.toggle('on',on);b.setAttribute('aria-pressed',on)});
     if(k==='aq'){store.set('aq',val);if(NB)NB.setAudioQuality(val);Object.keys(cache).forEach(x=>{if(/^st/.test(x))delete cache[x]});toast('Applies to the next song')}
+    else if(k==='eng'){store.set('eng',val);if(NB&&NB.setEngineMode)NB.setEngineMode(val);toast('Streaming engine: '+val)}
+    else if(k==='waq'){store.set('waq',val);store.set('aq',val);if(NB&&NB.setWifiAudioQuality)NB.setWifiAudioQuality(val);else if(NB)NB.setAudioQuality(val);toast('Wi-Fi quality: '+val)}
+    else if(k==='caq'){store.set('caq',val);if(NB&&NB.setCellularAudioQuality)NB.setCellularAudioQuality(val);toast('Cellular quality: '+val)}
     else{PS[k]=val;savePS();applyPS();if(k==='lm')lyr.mode=val;if(k==='lsz'||k==='lm')renderLyrics()}
     return}
   const b=e.target.closest('[data-set]');if(!b)return;const a=b.dataset.set;
@@ -1900,6 +1918,17 @@ $('#main').addEventListener('click',async e=>{
   else if(a==='clrrec'){if(await askConfirm('Clear recently played?','This removes all songs from your history.','Clear',true)){hist=[];store.set('hist',hist);delete cache.fy;toast('History cleared')}}
   else if(a==='clrsrch'){store.set('rs',[]);toast('Search history cleared')}
   else if(a==='server'){const v=await askText('Search server',store.get('source',''),{placeholder:'https://your-piped-server (empty = automatic)',ok:'Save'});if(v!==null){store.set('source',v.trim());if(NB)NB.setCustomServer(v.trim());Object.keys(cache).forEach(k=>delete cache[k]);render();toast(v.trim()?'Custom server saved':'Using automatic servers')}}
+  else if(a==='selfhosted'){
+    const prev=store.get('sh',{type:'none',baseUrl:'',username:'',tokenOrPassword:'',userId:''});
+    const t=await askText('Self-hosted server type',prev.type||'none',{placeholder:'jellyfin, subsonic, navidrome, or none',ok:'Next'});if(t===null)return;
+    const type=(t||'none').trim().toLowerCase();
+    if(type==='none'||!type){const cfg={type:'none',baseUrl:'',username:'',tokenOrPassword:'',userId:''};store.set('sh',cfg);if(NB&&NB.setSelfHostedServer)NB.setSelfHostedServer(JSON.stringify(cfg));render();toast('Self-hosted server disabled');return}
+    const url=await askText('Server Base URL',prev.baseUrl||'',{placeholder:'https://music.example.com',ok:'Next'});if(url===null)return;
+    const user=await askText('Username',prev.username||'',{placeholder:'username',ok:'Next'});if(user===null)return;
+    const tok=await askText(type==='jellyfin'?'API Key / Token':'Password / Token',prev.tokenOrPassword||'',{placeholder:'token or password',ok:'Save'});if(tok===null)return;
+    const cfg={type,baseUrl:url.trim().replace(/\/$/,''),username:user.trim(),tokenOrPassword:tok.trim(),userId:prev.userId||''};
+    store.set('sh',cfg);if(NB&&NB.setSelfHostedServer)NB.setSelfHostedServer(JSON.stringify(cfg));render();toast('Self-hosted '+type+' server saved');
+  }
   else if(a==='reset'){if(await askConfirm('Reset Pulse?','Playlists, liked songs, history and settings on this device will be deleted. This can’t be undone.','Reset',true)){try{localStorage.clear()}catch{}location.reload()}}
 });
 $('#main').addEventListener('change',async e=>{
@@ -2230,8 +2259,13 @@ if(NB){
     if(Array.isArray(lib)){downloaded=lib;store.set('downloaded',downloaded)}
     const ds=JSON.parse(NB.getDownloadStates()||'[]');
     if(Array.isArray(ds))ds.forEach(x=>{if(x&&x.id)dlStates[x.id]=x});
-    NB.setAudioQuality(store.get('aq','normal'));
+    if(typeof NB.setEngineMode==='function')NB.setEngineMode(store.get('eng','auto'));
+    if(typeof NB.setWifiAudioQuality==='function')NB.setWifiAudioQuality(store.get('waq',store.get('aq','high')));
+    if(typeof NB.setCellularAudioQuality==='function')NB.setCellularAudioQuality(store.get('caq',store.get('aq','normal')));
+    if(!NB.setWifiAudioQuality)NB.setAudioQuality(store.get('aq','normal'));
+    if(typeof NB.setSelfHostedServer==='function'&&store.get('sh',null))NB.setSelfHostedServer(JSON.stringify(store.get('sh')));
     NB.setCustomServer(store.get('source',''));
+    if(typeof NB.setDiscoveredMirrors==='function')NB.setDiscoveredMirrors(JSON.stringify(SRC.piped||[]),JSON.stringify(SRC.inv||[]));
     NB.setAutoplay(autoplay);
     NB.setVolume(Math.round(+$('#vol').value||80));
     const snap=JSON.parse(NB.getPlaybackSnapshot()||'{}');

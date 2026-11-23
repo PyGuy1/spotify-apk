@@ -1,9 +1,9 @@
 package com.example.playback
 
 import android.content.Context
+import com.example.model.PlaybackEngineMode
 import com.example.model.PulseTrack
-import org.json.JSONArray
-import org.json.JSONObject
+import com.example.model.SelfHostedServerConfig
 
 data class PersistedPlaybackState(
   val queue: List<PulseTrack>,
@@ -15,7 +15,11 @@ data class PersistedPlaybackState(
   val autoplayEnabled: Boolean,
   val volumePercent: Int,
   val audioQuality: String,
+  val wifiQuality: String,
+  val cellularQuality: String,
+  val engineMode: PlaybackEngineMode,
   val customServer: String,
+  val selfHostedConfig: SelfHostedServerConfig,
   val shuffleBackupUpcoming: List<PulseTrack> = emptyList(),
 )
 
@@ -66,11 +70,39 @@ class PlaybackStateStore(context: Context) {
 
   fun getAudioQuality(): String = prefs.getString(KEY_QUALITY, "normal").orEmpty().ifBlank { "normal" }
 
+  fun setWifiQuality(quality: String) {
+    prefs.edit().putString(KEY_WIFI_QUALITY, quality).apply()
+  }
+
+  fun getWifiQuality(): String =
+    prefs.getString(KEY_WIFI_QUALITY, null).orEmpty().ifBlank { getAudioQuality() }
+
+  fun setCellularQuality(quality: String) {
+    prefs.edit().putString(KEY_CELLULAR_QUALITY, quality).apply()
+  }
+
+  fun getCellularQuality(): String =
+    prefs.getString(KEY_CELLULAR_QUALITY, null).orEmpty().ifBlank { "normal" }
+
+  fun setEngineMode(mode: PlaybackEngineMode) {
+    prefs.edit().putString(KEY_ENGINE_MODE, mode.wireName).apply()
+  }
+
+  fun getEngineMode(): PlaybackEngineMode =
+    PlaybackEngineMode.fromWire(prefs.getString(KEY_ENGINE_MODE, PlaybackEngineMode.AUTO.wireName))
+
   fun setCustomServer(server: String) {
     prefs.edit().putString(KEY_CUSTOM_SERVER, server.trim()).apply()
   }
 
   fun getCustomServer(): String = prefs.getString(KEY_CUSTOM_SERVER, "").orEmpty()
+
+  fun setSelfHostedConfig(config: SelfHostedServerConfig) {
+    prefs.edit().putString(KEY_SELF_HOSTED_JSON, config.toJson(includeSecret = true).toString()).apply()
+  }
+
+  fun getSelfHostedConfig(): SelfHostedServerConfig =
+    SelfHostedServerConfig.fromJson(prefs.getString(KEY_SELF_HOSTED_JSON, null))
 
   fun load(): PersistedPlaybackState {
     val queue = PulseTrack.listFromJsonArray(prefs.getString(KEY_QUEUE, null))
@@ -88,7 +120,11 @@ class PlaybackStateStore(context: Context) {
       autoplayEnabled = prefs.getBoolean(KEY_AUTOPLAY, true),
       volumePercent = prefs.getInt(KEY_VOLUME, 80).coerceIn(0, 100),
       audioQuality = getAudioQuality(),
+      wifiQuality = getWifiQuality(),
+      cellularQuality = getCellularQuality(),
+      engineMode = getEngineMode(),
       customServer = getCustomServer(),
+      selfHostedConfig = getSelfHostedConfig(),
       shuffleBackupUpcoming = backup,
     )
   }
@@ -103,7 +139,11 @@ class PlaybackStateStore(context: Context) {
     private const val KEY_AUTOPLAY = "autoplay"
     private const val KEY_VOLUME = "volume"
     private const val KEY_QUALITY = "audio_quality"
+    private const val KEY_WIFI_QUALITY = "wifi_audio_quality"
+    private const val KEY_CELLULAR_QUALITY = "cellular_audio_quality"
+    private const val KEY_ENGINE_MODE = "engine_mode"
     private const val KEY_CUSTOM_SERVER = "custom_server"
+    private const val KEY_SELF_HOSTED_JSON = "self_hosted_json"
     private const val KEY_SHUF_BACKUP = "shuffle_backup"
   }
 }

@@ -14,15 +14,22 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.UnrecognizedInputFormatException
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.ts.AdtsExtractor
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.example.MainActivity
+import com.example.PulseLog
 import com.example.PulseRuntime
 import com.example.R
+import com.example.model.PlaybackEngineMode
 import com.example.model.PlaybackSnapshot
 import com.example.model.PulseTrack
+import com.example.model.SelfHostedServerConfig
 import com.example.stream.StreamResolver
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -34,6 +41,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 
 @OptIn(UnstableApi::class)
@@ -49,6 +57,7 @@ class PulsePlaybackService : MediaSessionService() {
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
   private val queueTracks = mutableListOf<PulseTrack>()
+  private val queueTrackMap = ConcurrentHashMap<String, PulseTrack>()
   private var shuffleBackupUpcoming: List<PulseTrack> = emptyList()
   private var shuffleEnabled = false
   private var repeatEnabled = false
@@ -56,6 +65,9 @@ class PulsePlaybackService : MediaSessionService() {
   private var autoplayEnabled = true
   private var volumePercent = 80
   private var audioQuality = "normal"
+  private var wifiQuality = "high"
+  private var cellularQuality = "normal"
+  private var engineMode = PlaybackEngineMode.AUTO
   private var lastErrorMessage = ""
   private var recoveryAttemptsForTrack = 0
   private var lastRecoveryTrackId = ""
@@ -78,7 +90,14 @@ class PulsePlaybackService : MediaSessionService() {
     autoplayEnabled = saved.autoplayEnabled
     volumePercent = saved.volumePercent
     audioQuality = saved.audioQuality
+    wifiQuality = saved.wifiQuality
+    cellularQuality = saved.cellularQuality
+    engineMode = saved.engineMode
     shuffleBackupUpcoming = saved.shuffleBackupUpcoming
+    runtime.streamResolver.setEngineMode(engineMode)
+    runtime.streamResolver.setWifiQuality(wifiQuality)
+    runtime.streamResolver.setCellularQuality(cellularQuality)
+    runtime.streamResolver.setSelfHostedServer(saved.selfHostedConfig)
 
     val loadControl =
       DefaultLoadControl.Builder()
@@ -86,16 +105,24 @@ class PulsePlaybackService : MediaSessionService() {
         .setBackBuffer(5_000, false)
         .build()
 
-    val mediaSourceFactory =
-      DefaultMediaSourceFactory(
-        PulseMediaDataSource.Factory(
-          context = this,
-          streamResolver = runtime.streamResolver,
-          downloadedRepo = runtime.downloadedRepo,
-          qualityProvider = { audioQuality },
-          okHttpClient = runtime.okHttpClient,
-        )
+    val extractorsFactory =
+      DefaultExtractorsFactory()
+        .setConstantBitrateSeekingEnabled(true)
+        .setAdtsExtractorFlags(AdtsExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING)
+
+    val upstreamFactory =
+      PulseMediaDataSource.Factory(
+        context = this,
+        streamResolver = runtime.streamResolver,
+        downloadedRepo = runtime.downloadedRepo,
+        qualityProvider = { null },
+        okHttpClient = runtime.okHttpClient,
+        trackMetadataProvider = { id -> queueTrackMap[id] },
       )
+    val cachingDataSourceFactory =
+      runtime.cacheModule.createPlaybackDataSourceFactory(upstreamFactory)
+    val mediaSourceFactory =
+      DefaultMediaSourceFactory(cachingDataSourceFactory, extractorsFactory)
 
     player =
       ExoPlayer.Builder(this)
@@ -191,6 +218,7 @@ class PulsePlaybackService : MediaSessionService() {
       }
       queueTracks.clear()
       queueTracks.addAll(saved.queue)
+      syncQueueTrackMap()
       val items = queueTracks.map { buildMediaItem(it) }
       val startIdx = saved.currentIndex.coerceIn(0, items.lastIndex)
       resolveArtworkForWindow(startIdx)
@@ -253,20 +281,51 @@ class PulsePlaybackService : MediaSessionService() {
       override fun onPlayerError(error: PlaybackException) {
         val idx = currentIndexSafe()
         val track = queueTracks.getOrNull(idx)
+        val diag = diagnoseError(error)
+
+        PulseLog.e(
+          TAG,
+          "Player error track='${track?.title ?: "<none>"}' id='${track?.id ?: ""}' " +
+            "code=${error.errorCodeName}(${error.errorCode}) category=${diag.category} " +
+            "attempt=${recoveryAttemptsForTrack + 1} detail=${diag.technicalDetail}",
+          error,
+        )
+
         if (track != null) {
           if (lastRecoveryTrackId != track.id) {
             lastRecoveryTrackId = track.id
             recoveryAttemptsForTrack = 0
           }
-          if (recoveryAttemptsForTrack < 2) {
+          val isPureLocal = track.id.startsWith("local_")
+          if (!isPureLocal && recoveryAttemptsForTrack < 2) {
             recoveryAttemptsForTrack++
             val resumePos = player.currentPosition.coerceAtLeast(0L)
+            lastErrorMessage =
+              if (diag.category == PulseFailureCategory.EXPIRED) "Stream expired; retrying…"
+              else "Reconnecting audio stream…"
+            PulseMediaDataSource.clearPinnedUrl(track.id)
             runtime.streamResolver.invalidate(track.id)
+
             serviceScope.launch {
-              withContext(Dispatchers.IO) {
-                runtime.streamResolver.resolveStream(track.id, audioQuality, forceRefresh = true)
-              }
+              val refreshed =
+                withContext(Dispatchers.IO) {
+                  runtime.streamResolver.resolveStreamForTrack(track, forceRefresh = true)
+                }
+              PulseLog.d(
+                TAG,
+                "Stream refresh for '${track.title}' resolved=${refreshed?.audioUrls?.size ?: 0} candidates",
+              )
               if (currentIndexSafe() == idx && queueTracks.getOrNull(idx)?.id == track.id) {
+                val refreshedTrack =
+                  if (track.localUri.isNotBlank()) track.copy(localUri = "") else track
+                if (refreshedTrack !== track) {
+                  queueTracks[idx] = refreshedTrack
+                  queueTrackMap[refreshedTrack.id] = refreshedTrack
+                }
+                val rebuiltItem = buildMediaItem(refreshedTrack)
+                if (idx < player.mediaItemCount) {
+                  player.replaceMediaItem(idx, rebuiltItem)
+                }
                 player.seekTo(idx, resumePos)
                 player.prepare()
                 player.play()
@@ -277,8 +336,8 @@ class PulsePlaybackService : MediaSessionService() {
           }
         }
 
-        lastErrorMessage = error.message ?: "Playback error"
-        if (idx in 0 until queueTracks.lastIndex) {
+        lastErrorMessage = diag.userMessage
+        if (diag.category != PulseFailureCategory.NETWORK && idx in 0 until queueTracks.lastIndex) {
           player.seekTo(idx + 1, 0L)
           player.prepare()
           player.play()
@@ -319,6 +378,7 @@ class PulsePlaybackService : MediaSessionService() {
     }
 
     val safeIndex = startIndex.coerceIn(0, queueTracks.lastIndex)
+    syncQueueTrackMap()
     val mediaItems = queueTracks.map { buildMediaItem(it) }
     player.setMediaItems(mediaItems, safeIndex, startPosMs.coerceAtLeast(0L))
     player.prepare()
@@ -339,6 +399,7 @@ class PulsePlaybackService : MediaSessionService() {
   ) {
     queueTracks.clear()
     queueTracks.addAll(tracks)
+    syncQueueTrackMap()
     val safeIndex = startIndex.coerceIn(0, queueTracks.lastIndex)
     val mediaItems = queueTracks.map { buildMediaItem(it) }
     player.setMediaItems(mediaItems, safeIndex, startPosMs.coerceAtLeast(0L))
@@ -427,6 +488,7 @@ class PulsePlaybackService : MediaSessionService() {
       while (insertPos < queueTracks.size && queueTracks[insertPos].uq != 0) insertPos++
     }
     queueTracks.add(insertPos, flagged)
+    queueTrackMap[flagged.id] = flagged
     player.addMediaItem(insertPos, buildMediaItem(flagged))
     scheduleUpcomingPreload(cur)
     resolveArtworkForWindow(cur)
@@ -440,6 +502,7 @@ class PulsePlaybackService : MediaSessionService() {
     val toAdd = tracks.filter { it.id.isNotBlank() && existingIds.add(it.id) }
     if (toAdd.isEmpty()) return
     queueTracks.addAll(toAdd)
+    toAdd.forEach { queueTrackMap[it.id] = it }
     player.addMediaItems(toAdd.map { buildMediaItem(it) })
     val cur = currentIndexSafe()
     scheduleUpcomingPreload(cur)
@@ -538,11 +601,55 @@ class PulsePlaybackService : MediaSessionService() {
   }
 
   fun setAudioQuality(quality: String) {
-    audioQuality = StreamResolver.normalizeQuality(quality)
-    runtime.stateStore.setAudioQuality(audioQuality)
-    runtime.downloadManager.setAudioQuality(audioQuality)
+    val norm = StreamResolver.normalizeQuality(quality)
+    audioQuality = norm
+    wifiQuality = norm
+    cellularQuality = norm
+    runtime.stateStore.setAudioQuality(norm)
+    runtime.stateStore.setWifiQuality(norm)
+    runtime.stateStore.setCellularQuality(norm)
+    runtime.streamResolver.setWifiQuality(norm)
+    runtime.streamResolver.setCellularQuality(norm)
     runtime.streamResolver.clearCache()
     scheduleUpcomingPreload(currentIndexSafe())
+    emitSnapshot()
+  }
+
+  fun setWifiAudioQuality(quality: String) {
+    val norm = StreamResolver.normalizeQuality(quality)
+    wifiQuality = norm
+    audioQuality = norm
+    runtime.stateStore.setWifiQuality(norm)
+    runtime.stateStore.setAudioQuality(norm)
+    runtime.streamResolver.setWifiQuality(norm)
+    runtime.streamResolver.clearCache()
+    scheduleUpcomingPreload(currentIndexSafe())
+    emitSnapshot()
+  }
+
+  fun setCellularAudioQuality(quality: String) {
+    val norm = StreamResolver.normalizeQuality(quality)
+    cellularQuality = norm
+    runtime.stateStore.setCellularQuality(norm)
+    runtime.streamResolver.setCellularQuality(norm)
+    runtime.streamResolver.clearCache()
+    scheduleUpcomingPreload(currentIndexSafe())
+    emitSnapshot()
+  }
+
+  fun setEngineMode(modeWire: String) {
+    val next = PlaybackEngineMode.fromWire(modeWire)
+    engineMode = next
+    runtime.stateStore.setEngineMode(next)
+    runtime.streamResolver.setEngineMode(next)
+    scheduleUpcomingPreload(currentIndexSafe())
+    emitSnapshot()
+  }
+
+  fun setSelfHostedServer(configJson: String) {
+    val cfg = SelfHostedServerConfig.fromJson(configJson)
+    runtime.stateStore.setSelfHostedConfig(cfg)
+    runtime.streamResolver.setSelfHostedServer(cfg)
     emitSnapshot()
   }
 
@@ -556,9 +663,14 @@ class PulsePlaybackService : MediaSessionService() {
     val idx = currentIndexSafe()
     val track = queueTracks.getOrNull(idx) ?: return
     val pos = player.currentPosition.coerceAtLeast(0L)
+    PulseLog.d(TAG, "Manual retry requested for '${track.title}' (${track.id}) at ${pos}ms")
+    PulseMediaDataSource.clearPinnedUrl(track.id)
     runtime.streamResolver.invalidate(track.id)
     lastErrorMessage = ""
     recoveryAttemptsForTrack = 0
+    if (idx < player.mediaItemCount) {
+      player.replaceMediaItem(idx, buildMediaItem(track))
+    }
     player.seekTo(idx, pos)
     player.prepare()
     player.play()
@@ -588,13 +700,25 @@ class PulsePlaybackService : MediaSessionService() {
 
   fun getSnapshot(): PlaybackSnapshot {
     val idx = currentIndexSafe()
+    val curTrack = queueTracks.getOrNull(idx)
     val curPosMs = player.currentPosition.coerceAtLeast(0L)
     val durMs =
       player.duration.takeIf { it != C.TIME_UNSET && it > 0L }
-        ?: ((queueTracks.getOrNull(idx)?.durationSec ?: 0) * 1000L)
+        ?: ((curTrack?.durationSec ?: 0) * 1000L)
     val sleepRem =
       if (sleepDeadlineMs > 0L) (sleepDeadlineMs - System.currentTimeMillis()).coerceAtLeast(0L)
       else 0L
+    val effQuality = runtime.streamResolver.networkQualityManager.effectiveQuality()
+    val sourceEngine =
+      when {
+        curTrack == null -> ""
+        curTrack.localUri.isNotBlank() || runtime.downloadedRepo.findPlayableLocalUri(curTrack.id) != null ->
+          "local-file"
+        runtime.cacheModule.hasDownloadCacheContent(curTrack.id) -> "download-cache"
+        else ->
+          runtime.streamResolver.getCachedStream(curTrack.id, effQuality)?.engineUsed
+            ?: if (runtime.cacheModule.hasPlayerCacheContent(curTrack.id)) "player-cache" else ""
+      }
     return PlaybackSnapshot(
       queue = queueTracks.toList(),
       currentIndex = idx,
@@ -611,9 +735,18 @@ class PulsePlaybackService : MediaSessionService() {
       volumePercent = volumePercent,
       sleepRemainingMs = sleepRem,
       sleepEndOfSong = sleepEndOfSong,
-      audioQuality = audioQuality,
+      audioQuality = effQuality,
       errorMessage = lastErrorMessage,
+      engineMode = engineMode.wireName,
+      wifiQuality = wifiQuality,
+      cellularQuality = cellularQuality,
+      activeSourceEngine = sourceEngine,
     )
+  }
+
+  private fun syncQueueTrackMap() {
+    queueTrackMap.clear()
+    queueTracks.forEach { if (it.id.isNotBlank()) queueTrackMap[it.id] = it }
   }
 
   private fun currentIndexSafe(): Int {
@@ -643,15 +776,22 @@ class PulsePlaybackService : MediaSessionService() {
       )
     }
 
-    val mediaUri =
-      track.localUri.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
-        ?: Uri.parse("pulse://track/${track.id}")
+    val resolvedLocal =
+      track.localUri.takeIf { it.isNotBlank() }
+        ?: runtime.downloadedRepo.findPlayableLocalUri(track.id).orEmpty()
+    val builder =
+      MediaItem.Builder()
+        .setMediaId(track.id)
+        .setMediaMetadata(metaBuilder.build())
 
-    return MediaItem.Builder()
-      .setMediaId(track.id)
-      .setUri(mediaUri)
-      .setMediaMetadata(metaBuilder.build())
-      .build()
+    if (resolvedLocal.isNotBlank()) {
+      builder.setUri(Uri.parse(resolvedLocal))
+    } else {
+      builder
+        .setUri(Uri.parse("pulse://track/${track.id}"))
+        .setCustomCacheKey(track.id)
+    }
+    return builder.build()
   }
 
   private fun resolveArtworkForWindow(centerIndex: Int) {
@@ -685,11 +825,11 @@ class PulsePlaybackService : MediaSessionService() {
       runtime.streamResolver.cancelAllPrefetches()
       return
     }
-    val upcomingIds =
+    val upcoming =
       ((centerIndex + 1)..minOf(centerIndex + 3, queueTracks.lastIndex)).mapNotNull { i ->
-        queueTracks.getOrNull(i)?.id
+        queueTracks.getOrNull(i)
       }
-    runtime.streamResolver.schedulePrefetch(upcomingIds, audioQuality)
+    runtime.streamResolver.schedulePrefetch(upcoming, quality = null)
   }
 
   private fun maybeTriggerBackgroundAutoplay(
@@ -712,6 +852,7 @@ class PulsePlaybackService : MediaSessionService() {
         if (toAdd.isNotEmpty()) {
           val insertStart = queueTracks.size
           queueTracks.addAll(toAdd)
+          toAdd.forEach { queueTrackMap[it.id] = it }
           player.addMediaItems(toAdd.map { buildMediaItem(it) })
           scheduleUpcomingPreload(currentIndexSafe())
           persistFullState()
@@ -768,7 +909,74 @@ class PulsePlaybackService : MediaSessionService() {
     listeners.forEach { it.onPlaybackSnapshot(snap) }
   }
 
+  private data class ErrorDiagnostics(
+    val category: PulseFailureCategory,
+    val userMessage: String,
+    val technicalDetail: String,
+  )
+
+  private fun diagnoseError(error: PlaybackException): ErrorDiagnostics {
+    var cur: Throwable? = error
+    while (cur != null) {
+      if (cur is PulseSourceException) {
+        return ErrorDiagnostics(
+          category = cur.category,
+          userMessage = cur.userMessage,
+          technicalDetail = "${cur::class.java.simpleName}: ${cur.message}",
+        )
+      }
+      if (cur is UnrecognizedInputFormatException) {
+        return ErrorDiagnostics(
+          category = PulseFailureCategory.FORMAT,
+          userMessage = "Unsupported audio format.",
+          technicalDetail = "UnrecognizedInputFormatException: ${cur.message}",
+        )
+      }
+      if (cur is MediaCodecRenderer.DecoderInitializationException) {
+        return ErrorDiagnostics(
+          category = PulseFailureCategory.FORMAT,
+          userMessage = "Unsupported audio format.",
+          technicalDetail = "DecoderInitializationException(${cur.mimeType}): ${cur.message}",
+        )
+      }
+      cur = cur.cause
+    }
+
+    return when (error.errorCode) {
+      PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+      PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ->
+        ErrorDiagnostics(
+          PulseFailureCategory.NETWORK,
+          "Network error. Check your connection.",
+          error.cause?.message ?: error.errorCodeName,
+        )
+      PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+      PlaybackException.ERROR_CODE_IO_NO_PERMISSION ->
+        ErrorDiagnostics(
+          PulseFailureCategory.EXPIRED,
+          "Stream expired or access denied.",
+          error.cause?.message ?: error.errorCodeName,
+        )
+      PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED,
+      PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+      PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+      PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ->
+        ErrorDiagnostics(
+          PulseFailureCategory.FORMAT,
+          "Unsupported audio format.",
+          error.cause?.message ?: error.errorCodeName,
+        )
+      else ->
+        ErrorDiagnostics(
+          PulseFailureCategory.RESOLVE,
+          "Unable to play this audio stream.",
+          error.cause?.message ?: error.errorCodeName,
+        )
+    }
+  }
+
   companion object {
+    private const val TAG = "PulsePlaybackService"
     @Volatile private var activeService: PulsePlaybackService? = null
     private val listeners = CopyOnWriteArraySet<Listener>()
     private val pendingActions = mutableListOf<(PulsePlaybackService) -> Unit>()

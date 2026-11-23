@@ -3,6 +3,77 @@ package com.example.model
 import org.json.JSONArray
 import org.json.JSONObject
 
+enum class PlaybackEngineMode(val wireName: String, val displayName: String) {
+  AUTO("auto", "Auto (InnerTubeX -> InnerTube -> BravePipe -> Piped)"),
+  POTOKEN("potoken", "PoToken (InnerTubeX/InnerTube -> BravePipe -> Piped)"),
+  BRAVEPIPE("bravepipe", "BravePipe (NewPipe -> InnerTubeX -> InnerTube -> Piped)");
+
+  companion object {
+    fun fromWire(value: String?): PlaybackEngineMode =
+      when (value?.trim()?.lowercase()) {
+        "potoken", "po_token" -> POTOKEN
+        "bravepipe", "newpipe", "brave_pipe" -> BRAVEPIPE
+        else -> AUTO
+      }
+  }
+}
+
+enum class SelfHostedServerType(val wireName: String) {
+  NONE("none"),
+  JELLYFIN("jellyfin"),
+  SUBSONIC("subsonic"),
+  NAVIDROME("navidrome");
+
+  companion object {
+    fun fromWire(value: String?): SelfHostedServerType =
+      when (value?.trim()?.lowercase()) {
+        "jellyfin" -> JELLYFIN
+        "subsonic" -> SUBSONIC
+        "navidrome" -> NAVIDROME
+        else -> NONE
+      }
+  }
+}
+
+data class SelfHostedServerConfig(
+  val type: SelfHostedServerType = SelfHostedServerType.NONE,
+  val baseUrl: String = "",
+  val username: String = "",
+  val tokenOrPassword: String = "",
+  val userId: String = "",
+) {
+  val isConfigured: Boolean
+    get() = type != SelfHostedServerType.NONE && baseUrl.trim().startsWith("http", ignoreCase = true)
+
+  fun toJson(includeSecret: Boolean = true): JSONObject =
+    JSONObject().apply {
+      put("type", type.wireName)
+      put("baseUrl", baseUrl)
+      put("username", username)
+      put("userId", userId)
+      if (includeSecret) put("tokenOrPassword", tokenOrPassword)
+      else put("hasSecret", tokenOrPassword.isNotBlank())
+    }
+
+  companion object {
+    fun fromJson(raw: String?): SelfHostedServerConfig {
+      if (raw.isNullOrBlank()) return SelfHostedServerConfig()
+      return try {
+        val obj = JSONObject(raw)
+        SelfHostedServerConfig(
+          type = SelfHostedServerType.fromWire(obj.optString("type")),
+          baseUrl = obj.optString("baseUrl", "").trim().trimEnd('/'),
+          username = obj.optString("username", "").trim(),
+          tokenOrPassword = obj.optString("tokenOrPassword", "").trim(),
+          userId = obj.optString("userId", "").trim(),
+        )
+      } catch (_: Exception) {
+        SelfHostedServerConfig()
+      }
+    }
+  }
+}
+
 data class PulseTrack(
   val id: String,
   val title: String,
@@ -17,6 +88,12 @@ data class PulseTrack(
   val auto: Int = 0,
   val pn: Int = 0,
   val localUri: String = "",
+  val lyrics: String = "",
+  val sourceType: String = "youtube",
+  val streamUrl: String = "",
+  val mimeType: String = "",
+  val bitrate: Int = 0,
+  val itag: Int = 0,
 ) {
   fun toJson(): JSONObject =
     JSONObject().apply {
@@ -33,6 +110,12 @@ data class PulseTrack(
       if (auto != 0) put("auto", auto)
       if (pn != 0) put("pn", pn)
       if (localUri.isNotBlank()) put("localUri", localUri)
+      if (lyrics.isNotBlank()) put("lyrics", lyrics)
+      if (sourceType.isNotBlank() && sourceType != "youtube") put("sourceType", sourceType)
+      if (streamUrl.isNotBlank()) put("streamUrl", streamUrl)
+      if (mimeType.isNotBlank()) put("mimeType", mimeType)
+      if (bitrate > 0) put("bitrate", bitrate)
+      if (itag > 0) put("itag", itag)
     }
 
   companion object {
@@ -56,6 +139,12 @@ data class PulseTrack(
         auto = if (obj.optBoolean("auto", false)) 1 else obj.optInt("auto", 0),
         pn = if (obj.optBoolean("pn", false)) 1 else obj.optInt("pn", 0),
         localUri = obj.optString("localUri", ""),
+        lyrics = obj.optString("lyrics", ""),
+        sourceType = obj.optString("sourceType", "youtube").ifBlank { "youtube" },
+        streamUrl = obj.optString("streamUrl", ""),
+        mimeType = obj.optString("mimeType", ""),
+        bitrate = obj.optInt("bitrate", 0),
+        itag = obj.optInt("itag", 0),
       )
     }
 
@@ -123,6 +212,9 @@ data class DownloadedSongRecord(
   val sizeBytes: Long,
   val addedAtMs: Long,
   val isAppManaged: Boolean = true,
+  val bitrate: Int = track.bitrate,
+  val itag: Int = track.itag,
+  val cacheStatus: String = "completed",
 ) {
   fun toJson(): JSONObject =
     track.toJson().apply {
@@ -133,6 +225,9 @@ data class DownloadedSongRecord(
       put("addedAt", addedAtMs)
       put("appManaged", isAppManaged)
       put("downloaded", true)
+      if (bitrate > 0) put("bitrate", bitrate)
+      if (itag > 0) put("itag", itag)
+      put("cacheStatus", cacheStatus)
     }
 
   companion object {
@@ -148,6 +243,9 @@ data class DownloadedSongRecord(
         sizeBytes = obj?.optLong("sizeBytes", 0L) ?: 0L,
         addedAtMs = obj?.optLong("addedAt", 0L) ?: 0L,
         isAppManaged = obj?.optBoolean("appManaged", true) ?: true,
+        bitrate = obj?.optInt("bitrate", track.bitrate) ?: track.bitrate,
+        itag = obj?.optInt("itag", track.itag) ?: track.itag,
+        cacheStatus = obj?.optString("cacheStatus", "completed").orEmpty().ifBlank { "completed" },
       )
     }
   }
@@ -171,6 +269,10 @@ data class PlaybackSnapshot(
   val sleepEndOfSong: Boolean,
   val audioQuality: String,
   val errorMessage: String,
+  val engineMode: String = PlaybackEngineMode.AUTO.wireName,
+  val wifiQuality: String = audioQuality,
+  val cellularQuality: String = "normal",
+  val activeSourceEngine: String = "",
 ) {
   fun toJson(): JSONObject =
     JSONObject().apply {
@@ -190,6 +292,10 @@ data class PlaybackSnapshot(
       put("sleepRemainingMs", sleepRemainingMs)
       put("sleepEndOfSong", sleepEndOfSong)
       put("audioQuality", audioQuality)
+      put("wifiQuality", wifiQuality)
+      put("cellularQuality", cellularQuality)
+      put("engineMode", engineMode)
+      put("activeSourceEngine", activeSourceEngine)
       put("error", errorMessage)
       put("engine", "native-media3")
     }

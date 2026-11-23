@@ -8,49 +8,86 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import com.example.PulseLog
+import com.example.db.DownloadedSongEntity
+import com.example.db.PulseDatabase
+import com.example.db.SongFormatEntity
 import com.example.model.DownloadedSongRecord
 import com.example.model.PulseTrack
+import com.example.playback.CacheModule
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import org.json.JSONArray
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 
-class DownloadedSongsRepository(private val context: Context) {
-  private val catalogFile = File(context.filesDir, "pulse_downloaded_catalog.json")
+class DownloadedSongsRepository(
+  private val context: Context,
+  private val database: PulseDatabase? = PulseDatabase.get(context),
+  private val cacheModule: CacheModule? = null,
+) {
+  private val legacyCatalogFile = File(context.filesDir, "pulse_downloaded_catalog.json")
   private val lock = Any()
   private val cachedSongs = CopyOnWriteArrayList<DownloadedSongRecord>()
 
   init {
-    loadCatalogFromDisk()
+    loadCatalogFromDatabaseOrLegacy()
   }
+
+  fun observeDownloadedSongs(): Flow<List<DownloadedSongRecord>>? =
+    database?.downloadedSongDao()?.observeAll()?.map { list -> list.map { it.toRecord() } }
 
   fun getCachedList(): List<DownloadedSongRecord> = cachedSongs.toList()
 
   fun findByTrackId(trackId: String): DownloadedSongRecord? =
     cachedSongs.firstOrNull { it.track.id == trackId }
+      ?: database?.downloadedSongDao()?.findByTrackIdSync(trackId)?.toRecord()
 
   fun findPlayableLocalUri(trackId: String): String? {
     val rec = findByTrackId(trackId) ?: return null
     return if (uriExistsAndReadable(rec.localUri)) rec.localUri else null
   }
 
+  fun saveSongFormat(format: SongFormatEntity) {
+    try {
+      database?.songFormatDao()?.upsertSync(format)
+    } catch (e: Exception) {
+      PulseLog.d(TAG, "Failed saving SongFormatEntity: ${e.message}")
+    }
+  }
+
+  fun getSongFormat(trackId: String): SongFormatEntity? =
+    try {
+      database?.songFormatDao()?.findByTrackIdSync(trackId)
+    } catch (_: Exception) {
+      null
+    }
+
   fun listExistingFileNames(): Set<String> {
     val names = mutableSetOf<String>()
     cachedSongs.forEach { if (it.fileName.isNotBlank()) names.add(it.fileName) }
-    queryMediaStorePulseFiles().forEach { names.add(it.fileName) }
+    queryMediaStoreMusicFiles().forEach { names.add(it.fileName) }
+    listAppPyMusicDir().listFiles()?.forEach { if (it.isFile) names.add(it.name) }
     listAppLegacyPulseDir().listFiles()?.forEach { if (it.isFile) names.add(it.name) }
     return names
   }
 
   fun upsertManagedDownload(record: DownloadedSongRecord): List<DownloadedSongRecord> =
     synchronized(lock) {
+      val enriched =
+        record.copy(
+          cacheStatus =
+            if (cacheModule?.hasDownloadCacheContent(record.track.id) == true) "cached+file"
+            else record.cacheStatus.ifBlank { "completed" },
+        )
       val next =
-        mutableListOf(record).apply {
-          addAll(cachedSongs.filter { it.track.id != record.track.id && it.localUri != record.localUri })
+        mutableListOf(enriched).apply {
+          addAll(cachedSongs.filter { it.track.id != enriched.track.id && it.localUri != enriched.localUri })
         }
       cachedSongs.clear()
       cachedSongs.addAll(next)
-      saveCatalogToDisk(next)
+      persistCatalog(next, singleUpsert = enriched)
       next
     }
 
@@ -67,6 +104,8 @@ class DownloadedSongsRepository(private val context: Context) {
         durationSec = meta.durationSec,
         thumbUrl = "",
         localUri = uri.toString(),
+        sourceType = "local",
+        mimeType = meta.mimeType,
       )
     val record =
       DownloadedSongRecord(
@@ -77,6 +116,7 @@ class DownloadedSongsRepository(private val context: Context) {
         sizeBytes = meta.sizeBytes,
         addedAtMs = System.currentTimeMillis(),
         isAppManaged = false,
+        cacheStatus = "local_import",
       )
     upsertManagedDownload(record)
     return record
@@ -89,6 +129,7 @@ class DownloadedSongsRepository(private val context: Context) {
           (trackId.isNotBlank() && it.track.id == trackId) ||
             (localUri.isNotBlank() && it.localUri == localUri)
         }
+      val resolvedTrackId = target?.track?.id?.ifBlank { trackId } ?: trackId
       val uriString = target?.localUri?.ifBlank { localUri } ?: localUri
       var fileRemoved = true
       if (uriString.isNotBlank()) {
@@ -123,28 +164,44 @@ class DownloadedSongsRepository(private val context: Context) {
             !uriExistsAndReadable(uriString)
           }
       }
+      if (resolvedTrackId.isNotBlank()) {
+        cacheModule?.removeFromDownloadCache(resolvedTrackId)
+      }
       val remaining =
         cachedSongs.filterNot {
-          (trackId.isNotBlank() && it.track.id == trackId) ||
+          (resolvedTrackId.isNotBlank() && it.track.id == resolvedTrackId) ||
             (uriString.isNotBlank() && it.localUri == uriString)
         }
       cachedSongs.clear()
       cachedSongs.addAll(remaining)
-      saveCatalogToDisk(remaining)
+      try {
+        if (resolvedTrackId.isNotBlank()) {
+          database?.downloadedSongDao()?.deleteByTrackIdSync(resolvedTrackId)
+        }
+        if (uriString.isNotBlank()) {
+          database?.downloadedSongDao()?.deleteByLocalUriSync(uriString)
+        }
+      } catch (e: Exception) {
+        PulseLog.d(TAG, "Room delete fallback rewrite: ${e.message}")
+        persistCatalog(remaining)
+      }
       return fileRemoved
     }
   }
 
   fun syncWithStorage(): List<DownloadedSongRecord> {
     synchronized(lock) {
-      val mediaEntries = queryMediaStorePulseFiles()
-      val legacyFiles = listAppLegacyPulseDir().listFiles()?.filter { it.isFile && it.length() > 2048 }.orEmpty()
+      val mediaEntries = queryMediaStoreMusicFiles()
+      val appLocalFiles =
+        (listAppPyMusicDir().listFiles()?.toList().orEmpty() +
+          listAppLegacyPulseDir().listFiles()?.toList().orEmpty())
+          .filter { it.isFile && it.length() > 2048 }
 
       val byUri = cachedSongs.associateBy { it.localUri }.toMutableMap()
       val reconciled = mutableListOf<DownloadedSongRecord>()
       val seenUris = mutableSetOf<String>()
 
-      // 1. Reconcile MediaStore items in Music/Pulse/
+      // 1. Reconcile MediaStore items in Music/PyMusic/ and legacy Music/Pulse/
       for (msEntry in mediaEntries) {
         seenUris.add(msEntry.contentUri)
         val existing = byUri[msEntry.contentUri]
@@ -167,6 +224,8 @@ class DownloadedSongsRepository(private val context: Context) {
               album = msEntry.album,
               durationSec = msEntry.durationSec,
               localUri = msEntry.contentUri,
+              sourceType = "local",
+              mimeType = msEntry.mimeType,
             )
           reconciled.add(
             DownloadedSongRecord(
@@ -182,8 +241,8 @@ class DownloadedSongsRepository(private val context: Context) {
         }
       }
 
-      // 2. Reconcile app-local legacy Pulse directory (API 24-28 fallback)
-      for (file in legacyFiles) {
+      // 2. Reconcile app-local Music/PyMusic (and legacy Pulse) files
+      for (file in appLocalFiles) {
         val fileUri = Uri.fromFile(file).toString()
         if (seenUris.contains(fileUri)) continue
         seenUris.add(fileUri)
@@ -201,6 +260,8 @@ class DownloadedSongsRepository(private val context: Context) {
               album = meta.album,
               durationSec = meta.durationSec,
               localUri = fileUri,
+              sourceType = "local",
+              mimeType = meta.mimeType,
             )
           reconciled.add(
             DownloadedSongRecord(
@@ -216,7 +277,7 @@ class DownloadedSongsRepository(private val context: Context) {
         }
       }
 
-      // 3. Preserve non-Music/Pulse imported/SAVed URIs only if they still resolve cleanly
+      // 3. Preserve non-folder imported URIs only if they still resolve cleanly
       for (existing in cachedSongs) {
         if (seenUris.contains(existing.localUri)) continue
         if (uriExistsAndReadable(existing.localUri)) {
@@ -228,13 +289,17 @@ class DownloadedSongsRepository(private val context: Context) {
       val sorted = reconciled.sortedByDescending { it.addedAtMs }
       cachedSongs.clear()
       cachedSongs.addAll(sorted)
-      saveCatalogToDisk(sorted)
+      persistCatalog(sorted)
       return sorted
     }
   }
 
+  fun listAppPyMusicDir(): File =
+    File(context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir, PYMUSIC_FOLDER)
+      .apply { mkdirs() }
+
   fun listAppLegacyPulseDir(): File =
-    File(context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir, "Pulse")
+    File(context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir, LEGACY_PULSE_FOLDER)
       .apply { mkdirs() }
 
   private data class MediaStoreAudioRow(
@@ -249,7 +314,7 @@ class DownloadedSongsRepository(private val context: Context) {
     val dateAddedSec: Long,
   )
 
-  private fun queryMediaStorePulseFiles(): List<MediaStoreAudioRow> {
+  private fun queryMediaStoreMusicFiles(): List<MediaStoreAudioRow> {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return emptyList()
     val rows = mutableListOf<MediaStoreAudioRow>()
     val projection =
@@ -266,8 +331,13 @@ class DownloadedSongsRepository(private val context: Context) {
         MediaStore.Audio.Media.RELATIVE_PATH,
       )
     val selection =
-      "${MediaStore.Audio.Media.RELATIVE_PATH} LIKE ? AND ${MediaStore.Audio.Media.IS_PENDING} = 0"
-    val args = arrayOf("${Environment.DIRECTORY_MUSIC}/Pulse%")
+      "(${MediaStore.Audio.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Audio.Media.RELATIVE_PATH} LIKE ?) " +
+        "AND ${MediaStore.Audio.Media.IS_PENDING} = 0"
+    val args =
+      arrayOf(
+        "${Environment.DIRECTORY_MUSIC}/$PYMUSIC_FOLDER%",
+        "${Environment.DIRECTORY_MUSIC}/$LEGACY_PULSE_FOLDER%",
+      )
     val sort = "${MediaStore.Audio.Media.DATE_ADDED} DESC"
     try {
       context.contentResolver
@@ -410,10 +480,24 @@ class DownloadedSongsRepository(private val context: Context) {
     )
   }
 
-  private fun loadCatalogFromDisk() {
-    if (!catalogFile.exists()) return
+  private fun loadCatalogFromDatabaseOrLegacy() {
+    val fromRoom =
+      try {
+        database?.downloadedSongDao()?.getAllSync()?.map { it.toRecord() }.orEmpty()
+      } catch (e: Exception) {
+        PulseLog.d(TAG, "Room load error: ${e.message}")
+        emptyList()
+      }
+
+    if (fromRoom.isNotEmpty()) {
+      cachedSongs.clear()
+      cachedSongs.addAll(fromRoom)
+      return
+    }
+
+    if (!legacyCatalogFile.exists()) return
     try {
-      val arr = JSONArray(catalogFile.readText())
+      val arr = JSONArray(legacyCatalogFile.readText())
       val loaded =
         buildList {
           for (i in 0 until arr.length()) {
@@ -422,15 +506,41 @@ class DownloadedSongsRepository(private val context: Context) {
         }
       cachedSongs.clear()
       cachedSongs.addAll(loaded)
+      if (loaded.isNotEmpty() && database != null) {
+        database.downloadedSongDao().upsertAllSync(loaded.map { DownloadedSongEntity.fromRecord(it) })
+      }
     } catch (_: Exception) {}
   }
 
-  private fun saveCatalogToDisk(items: List<DownloadedSongRecord>) {
+  private fun persistCatalog(items: List<DownloadedSongRecord>, singleUpsert: DownloadedSongRecord? = null) {
+    if (database != null) {
+      try {
+        if (singleUpsert != null) {
+          database.downloadedSongDao().upsertSync(DownloadedSongEntity.fromRecord(singleUpsert))
+        } else {
+          database.runInTransaction {
+            database.downloadedSongDao().deleteAllSync()
+            if (items.isNotEmpty()) {
+              database.downloadedSongDao().upsertAllSync(items.map { DownloadedSongEntity.fromRecord(it) })
+            }
+          }
+        }
+        return
+      } catch (e: Exception) {
+        PulseLog.d(TAG, "Room persist fallback to JSON: ${e.message}")
+      }
+    }
     try {
       val arr = JSONArray().apply { items.forEach { put(it.toJson()) } }
-      val temp = File(catalogFile.parentFile, "${catalogFile.name}.tmp")
+      val temp = File(legacyCatalogFile.parentFile, "${legacyCatalogFile.name}.tmp")
       temp.writeText(arr.toString())
-      temp.renameTo(catalogFile)
+      temp.renameTo(legacyCatalogFile)
     } catch (_: Exception) {}
+  }
+
+  companion object {
+    private const val TAG = "DownloadedSongsRepo"
+    const val PYMUSIC_FOLDER = "PyMusic"
+    const val LEGACY_PULSE_FOLDER = "Pulse"
   }
 }

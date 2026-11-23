@@ -9,8 +9,10 @@ import com.example.PulseRuntime
 import com.example.download.SongDownloadManager
 import com.example.model.DownloadProgressItem
 import com.example.model.DownloadedSongRecord
+import com.example.model.PlaybackEngineMode
 import com.example.model.PlaybackSnapshot
 import com.example.model.PulseTrack
+import com.example.model.SelfHostedServerConfig
 import com.example.playback.PulsePlaybackService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -60,7 +62,7 @@ class PulseJsBridge(
         latch.countDown()
       }
       try {
-        latch.await(250, TimeUnit.MILLISECONDS)
+        latch.await(1_000, TimeUnit.MILLISECONDS)
       } catch (_: InterruptedException) {}
     }
     return isTrustedAppUrl(currentUrl)
@@ -100,6 +102,9 @@ class PulseJsBridge(
         sleepEndOfSong = false,
         audioQuality = saved.audioQuality,
         errorMessage = "",
+        engineMode = saved.engineMode.wireName,
+        wifiQuality = saved.wifiQuality,
+        cellularQuality = saved.cellularQuality,
       )
     return fallbackSnap.toJson().toString()
   }
@@ -225,8 +230,61 @@ class PulseJsBridge(
   fun setAudioQuality(quality: String) {
     if (!assertTrustedOrigin()) return
     runtime.stateStore.setAudioQuality(quality)
-    runtime.downloadManager.setAudioQuality(quality)
+    runtime.stateStore.setWifiQuality(quality)
+    runtime.stateStore.setCellularQuality(quality)
+    runtime.streamResolver.setWifiQuality(quality)
+    runtime.streamResolver.setCellularQuality(quality)
+    runtime.streamResolver.clearCache()
     PulsePlaybackService.dispatchOrQueue { it.setAudioQuality(quality) }
+  }
+
+  @JavascriptInterface
+  fun setWifiAudioQuality(quality: String) {
+    if (!assertTrustedOrigin()) return
+    runtime.stateStore.setWifiQuality(quality)
+    runtime.streamResolver.setWifiQuality(quality)
+    runtime.streamResolver.clearCache()
+    PulsePlaybackService.dispatchOrQueue { it.setWifiAudioQuality(quality) }
+  }
+
+  @JavascriptInterface
+  fun setCellularAudioQuality(quality: String) {
+    if (!assertTrustedOrigin()) return
+    runtime.stateStore.setCellularQuality(quality)
+    runtime.streamResolver.setCellularQuality(quality)
+    runtime.streamResolver.clearCache()
+    PulsePlaybackService.dispatchOrQueue { it.setCellularAudioQuality(quality) }
+  }
+
+  @JavascriptInterface
+  fun setEngineMode(modeWire: String) {
+    if (!assertTrustedOrigin()) return
+    val parsed = PlaybackEngineMode.fromWire(modeWire)
+    runtime.stateStore.setEngineMode(parsed)
+    runtime.streamResolver.setEngineMode(parsed)
+    PulsePlaybackService.dispatchOrQueue { it.setEngineMode(parsed.wireName) }
+  }
+
+  @JavascriptInterface
+  fun getEngineMode(): String {
+    if (!assertTrustedOrigin()) return PlaybackEngineMode.AUTO.wireName
+    return runtime.streamResolver.getEngineMode().wireName
+  }
+
+  @JavascriptInterface
+  fun setSelfHostedServer(configJson: String) {
+    if (!assertTrustedOrigin()) return
+    val cfg = SelfHostedServerConfig.fromJson(configJson)
+    runtime.stateStore.setSelfHostedConfig(cfg)
+    runtime.streamResolver.setSelfHostedServer(cfg)
+    runtime.streamResolver.clearCache()
+    PulsePlaybackService.dispatchOrQueue { it.setSelfHostedServer(configJson) }
+  }
+
+  @JavascriptInterface
+  fun getSelfHostedServer(): String {
+    if (!assertTrustedOrigin()) return "{}"
+    return runtime.stateStore.getSelfHostedConfig().toJson(includeSecret = false).toString()
   }
 
   @JavascriptInterface
@@ -236,6 +294,21 @@ class PulseJsBridge(
     runtime.streamResolver.setCustomServer(serverUrl)
     runtime.streamResolver.clearCache()
     PulsePlaybackService.dispatchOrQueue { it.setCustomServer(serverUrl) }
+  }
+
+  @JavascriptInterface
+  fun setDiscoveredMirrors(pipedJson: String, invidiousJson: String) {
+    if (!assertTrustedOrigin()) return
+    val piped = parseStringList(pipedJson)
+    val inv = parseStringList(invidiousJson)
+    runtime.streamResolver.setDiscoveredMirrors(piped, inv)
+  }
+
+  @JavascriptInterface
+  fun seedPreResolvedStream(trackId: String, quality: String, urlsJson: String) {
+    if (!assertTrustedOrigin()) return
+    val urls = parseStringList(urlsJson)
+    runtime.streamResolver.seedCandidateUrls(trackId, quality, urls)
   }
 
   @JavascriptInterface

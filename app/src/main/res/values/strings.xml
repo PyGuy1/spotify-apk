@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">Pulse</string>
+    <string name="download_channel_name">Song Downloads</string>
+    <string name="download_channel_description">Background music downloads for offline playback</string>
 </resources>

@@ -8,27 +8,43 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.annotation.OptIn
 import androidx.core.app.NotificationCompat
+import androidx.media3.common.C
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import com.example.PulseLog
 import com.example.R
+import com.example.db.SongFormatEntity
 import com.example.model.DownloadProgressItem
 import com.example.model.DownloadStatus
 import com.example.model.DownloadedSongRecord
 import com.example.model.PulseTrack
+import com.example.playback.CacheModule
+import com.example.stream.AudioCandidate
 import com.example.stream.StreamResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
+@OptIn(UnstableApi::class)
 class SongDownloadManager(
   private val context: Context,
   private val streamResolver: StreamResolver,
@@ -40,6 +56,8 @@ class SongDownloadManager(
       .followRedirects(true)
       .followSslRedirects(true)
       .build(),
+  private val cacheModule: CacheModule? = null,
+  private val forceAppDirStorage: Boolean = false,
 ) {
   interface Listener {
     fun onDownloadUpdated(item: DownloadProgressItem)
@@ -50,19 +68,24 @@ class SongDownloadManager(
   private val states = ConcurrentHashMap<String, DownloadProgressItem>()
   private val activeJobs = ConcurrentHashMap<String, Job>()
   private val activeCalls = ConcurrentHashMap<String, Call>()
+  private val activeDataSources = ConcurrentHashMap<String, DataSource>()
   private val savedUrls = ConcurrentHashMap<String, List<String>>()
   private val listeners = ConcurrentHashMap.newKeySet<Listener>()
-  private val notificationManager =
-    context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+  private val notificationManager: NotificationManager? =
+    try {
+      context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+    } catch (_: Exception) {
+      null
+    }
 
-  @Volatile private var audioQuality: String = "normal"
+  @Volatile private var audioQuality: String? = null
 
   init {
     ensureNotificationChannel()
   }
 
-  fun setAudioQuality(quality: String) {
-    audioQuality = StreamResolver.normalizeQuality(quality)
+  fun setAudioQuality(quality: String?) {
+    audioQuality = quality?.takeIf { it.isNotBlank() }?.let { StreamResolver.normalizeQuality(it) }
   }
 
   fun addListener(listener: Listener) {
@@ -75,6 +98,8 @@ class SongDownloadManager(
 
   fun getAllDownloadStates(): List<DownloadProgressItem> =
     states.values.sortedByDescending { it.updatedAtMs }
+
+  fun getDownloadState(trackId: String): DownloadProgressItem? = states[trackId]
 
   fun syncLibraryAndNotify(): List<DownloadedSongRecord> {
     val synced = downloadedRepo.syncWithStorage()
@@ -131,7 +156,12 @@ class SongDownloadManager(
           performDownload(track, cleanCandidates)
         } finally {
           activeJobs.remove(track.id)
-          activeCalls.remove(track.id)
+          activeCalls.remove(track.id)?.cancel()
+          activeDataSources.remove(track.id)?.let { ds ->
+            try {
+              ds.close()
+            } catch (_: Exception) {}
+          }
         }
       }
     activeJobs[track.id] = job
@@ -139,6 +169,11 @@ class SongDownloadManager(
 
   fun cancelDownload(trackId: String) {
     activeCalls.remove(trackId)?.cancel()
+    activeDataSources.remove(trackId)?.let { ds ->
+      try {
+        ds.close()
+      } catch (_: Exception) {}
+    }
     activeJobs.remove(trackId)?.cancel()
     val prev = states[trackId] ?: return
     val cancelled =
@@ -149,7 +184,9 @@ class SongDownloadManager(
       )
     states[trackId] = cancelled
     emitState(cancelled)
-    notificationManager.cancel(notifIdFor(trackId))
+    try {
+      notificationManager?.cancel(notifIdFor(trackId))
+    } catch (_: Exception) {}
   }
 
   fun retryDownload(trackId: String) {
@@ -159,6 +196,7 @@ class SongDownloadManager(
   }
 
   fun deleteDownloadedSong(trackId: String, localUri: String): Boolean {
+    cancelDownload(trackId)
     val ok = downloadedRepo.deleteSong(trackId, localUri)
     states.remove(trackId)
     syncLibraryAndNotify()
@@ -176,29 +214,82 @@ class SongDownloadManager(
     emitState(resolving)
     updateDownloadNotification(resolving)
 
-    val allCandidates = LinkedHashSet<String>()
-    allCandidates.addAll(initialCandidates)
-    val resolved = streamResolver.resolveStream(track.id, audioQuality, forceRefresh = initialCandidates.isEmpty())
-    resolved?.audioUrls?.forEach { allCandidates.add(it) }
+    val candidateMap = LinkedHashMap<String, AudioCandidate>()
+    val resolved =
+      streamResolver.resolveStreamForTrack(
+        track = track,
+        explicitQuality = audioQuality,
+        forceRefresh = initialCandidates.isEmpty(),
+      )
+    resolved?.candidates?.forEach { cand ->
+      candidateMap.putIfAbsent(cand.url, cand)
+    }
+    resolved?.audioUrls?.forEach { url ->
+      candidateMap.putIfAbsent(
+        url,
+        AudioCandidate(
+          url = url,
+          mimeType = track.mimeType,
+          bitrate = track.bitrate.takeIf { it > 0 } ?: 128_000,
+          sourceHost = StreamResolver.extractHostKey(url),
+          itag = track.itag,
+          engineSource = resolved.engineUsed,
+        ),
+      )
+    }
+    initialCandidates.forEach { url ->
+      candidateMap.putIfAbsent(
+        url,
+        AudioCandidate(
+          url = url,
+          mimeType = "",
+          bitrate = 128_000,
+          sourceHost = StreamResolver.extractHostKey(url),
+          engineSource = "js-seed",
+        ),
+      )
+    }
 
-    if (allCandidates.isEmpty()) {
+    if (candidateMap.isEmpty()) {
       failDownload(track, "No playable audio stream found")
       return
     }
 
     var lastError = "Download failed"
-    var triedFresh = resolved != null
+    var triedFresh = resolved != null && initialCandidates.isEmpty()
+    val queue = ArrayDeque(candidateMap.values.toList())
 
-    val urlQueue = ArrayDeque(allCandidates.toList())
-    while (urlQueue.isNotEmpty()) {
-      val candidateUrl = urlQueue.removeFirst()
+    while (queue.isNotEmpty()) {
+      if (!coroutineContext.isActive) throw CancellationException("Download cancelled")
+      val candidate = queue.removeFirst()
       try {
-        val result = streamUrlToStorage(track, candidateUrl)
+        val result = downloadCandidateToStorage(track, candidate, resolved?.engineUsed.orEmpty())
         if (result != null) {
           downloadedRepo.upsertManagedDownload(result)
+          if (candidate.itag > 0 || candidate.mimeType.isNotBlank() || candidate.bitrate > 0) {
+            downloadedRepo.saveSongFormat(
+              SongFormatEntity(
+                trackId = track.id,
+                itag = candidate.itag,
+                mimeType = result.mimeType,
+                codecs = candidate.codecs,
+                bitrate = candidate.bitrate,
+                sampleRate = candidate.sampleRate,
+                contentLength = result.sizeBytes,
+                loudnessDb = resolved?.loudnessDb,
+                engineUsed = candidate.engineSource.ifBlank { resolved?.engineUsed.orEmpty() },
+              )
+            )
+          }
           val done =
             DownloadProgressItem(
-              track = track.copy(localUri = result.localUri),
+              track =
+                track.copy(
+                  localUri = result.localUri,
+                  mimeType = result.mimeType,
+                  bitrate = result.bitrate,
+                  itag = result.itag,
+                ),
               status = DownloadStatus.COMPLETED,
               progressPercent = 100,
               bytesDownloaded = result.sizeBytes,
@@ -217,12 +308,31 @@ class SongDownloadManager(
         throw c
       } catch (e: Exception) {
         lastError = e.message ?: "Stream transfer interrupted"
-        if (!triedFresh && urlQueue.isEmpty()) {
+        PulseLog.w(TAG, "Download candidate failed track=${track.id} host=${candidate.sourceHost}: $lastError")
+        if (!triedFresh && queue.isEmpty()) {
           triedFresh = true
           streamResolver.invalidate(track.id)
-          streamResolver.resolveStream(track.id, audioQuality, forceRefresh = true)
-            ?.audioUrls
-            ?.forEach { urlQueue.addLast(it) }
+          val fresh = streamResolver.resolveStreamForTrack(track, explicitQuality = audioQuality, forceRefresh = true)
+          fresh?.candidates?.forEach { cand ->
+            if (!candidateMap.containsKey(cand.url)) {
+              candidateMap[cand.url] = cand
+              queue.addLast(cand)
+            }
+          }
+          fresh?.audioUrls?.forEach { url ->
+            if (!candidateMap.containsKey(url)) {
+              val fallback =
+                AudioCandidate(
+                  url = url,
+                  mimeType = "",
+                  bitrate = 128_000,
+                  sourceHost = StreamResolver.extractHostKey(url),
+                  engineSource = fresh.engineUsed,
+                )
+              candidateMap[url] = fallback
+              queue.addLast(fallback)
+            }
+          }
         }
       }
     }
@@ -230,16 +340,107 @@ class SongDownloadManager(
     failDownload(track, lastError)
   }
 
-  private fun streamUrlToStorage(track: PulseTrack, url: String): DownloadedSongRecord? {
-    val req =
-      Request.Builder()
-        .url(url)
-        .header(
-          "User-Agent",
-          "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36",
+  private suspend fun downloadCandidateToStorage(
+    track: PulseTrack,
+    candidate: AudioCandidate,
+    engineUsed: String,
+  ): DownloadedSongRecord? {
+    // Prefer Media3 CacheModule DataSource so chunks already in playerCache are reused into downloadCache
+    if (cacheModule != null && candidate.headers.isEmpty()) {
+      return downloadViaCacheModule(track, candidate, engineUsed)
+    }
+    return downloadViaOkHttpDirect(track, candidate, engineUsed)
+  }
+
+  private suspend fun downloadViaCacheModule(
+    track: PulseTrack,
+    candidate: AudioCandidate,
+    engineUsed: String,
+  ): DownloadedSongRecord? {
+    val activeCache = cacheModule ?: return null
+    val callFactory =
+      Call.Factory { request ->
+        okHttpClient.newCall(request).also { call -> activeCalls[track.id] = call }
+      }
+    val upstreamFactory =
+      OkHttpDataSource.Factory(callFactory)
+        .setUserAgent(USER_AGENT_ANDROID)
+        .setDefaultRequestProperties(
+          mapOf(
+            "Accept" to "audio/*, */*;q=0.5",
+            "Accept-Encoding" to "identity",
+          )
         )
+    val downloadDataSource = activeCache.createDownloadDataSourceFactory(upstreamFactory).createDataSource()
+    activeDataSources[track.id] = downloadDataSource
+
+    val spec =
+      DataSpec.Builder()
+        .setUri(Uri.parse(candidate.url))
+        .setKey(track.id)
         .build()
-    val call = okHttpClient.newCall(req)
+
+    try {
+      val openedLength =
+        try {
+          downloadDataSource.open(spec)
+        } catch (e: HttpDataSource.InvalidResponseCodeException) {
+          throw IllegalStateException("HTTP ${e.responseCode}")
+        }
+      val totalBytes = if (openedLength == C.LENGTH_UNSET.toLong()) -1L else openedLength
+      val responseCt =
+        downloadDataSource.responseHeaders.entries
+          .firstOrNull { it.key.equals("Content-Type", ignoreCase = true) }
+          ?.value
+          ?.firstOrNull()
+          .orEmpty()
+          .ifBlank { candidate.mimeType }
+
+      val dsInput =
+        object : InputStream() {
+          private val oneByte = ByteArray(1)
+
+          override fun read(): Int {
+            val n = read(oneByte, 0, 1)
+            return if (n == -1) -1 else oneByte[0].toInt() and 0xFF
+          }
+
+          override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val r = downloadDataSource.read(b, off, len)
+            return if (r == C.RESULT_END_OF_INPUT) -1 else r
+          }
+        }
+
+      return consumeStreamAndWriteFile(
+        track = track,
+        candidate = candidate,
+        contentType = responseCt,
+        totalBytes = totalBytes,
+        stream = dsInput,
+        onInvalidPayload = { activeCache.removeFromPlayerCache(track.id); activeCache.removeFromDownloadCache(track.id) },
+      )
+    } finally {
+      activeDataSources.remove(track.id)
+      try {
+        downloadDataSource.close()
+      } catch (_: Exception) {}
+    }
+  }
+
+  private suspend fun downloadViaOkHttpDirect(
+    track: PulseTrack,
+    candidate: AudioCandidate,
+    engineUsed: String,
+  ): DownloadedSongRecord? {
+    val reqBuilder =
+      Request.Builder()
+        .url(candidate.url)
+        .header("User-Agent", USER_AGENT_ANDROID)
+        .header("Accept-Encoding", "identity")
+    candidate.headers.forEach { (k, v) ->
+      if (v.isNotBlank()) reqBuilder.header(k, v)
+    }
+    val call = okHttpClient.newCall(reqBuilder.build())
     activeCalls[track.id] = call
 
     call.execute().use { resp ->
@@ -247,43 +448,63 @@ class SongDownloadManager(
         throw IllegalStateException("HTTP ${resp.code}")
       }
       val body = resp.body ?: throw IllegalStateException("Empty response body")
-      val contentType = resp.header("Content-Type").orEmpty()
+      val contentType = resp.header("Content-Type").orEmpty().ifBlank { candidate.mimeType }
       val contentLength = body.contentLength()
       val stream = body.byteStream()
-
-      // Read first 128 bytes to inspect magic header & reject HTML/JSON/text pages cleanly
-      val headBuf = ByteArray(128)
-      var headRead = 0
-      while (headRead < headBuf.size) {
-        val r = stream.read(headBuf, headRead, headBuf.size - headRead)
-        if (r <= 0) break
-        headRead += r
-      }
-      if (headRead <= 0) throw IllegalStateException("Stream returned 0 bytes")
-      val headSlice = headBuf.copyOf(headRead)
-      val format = SongFilenameUtils.inspectStreamFormat(contentType, headSlice, url)
-      if (!format.isValidAudio) {
-        throw IllegalStateException(format.rejectionReason)
-      }
-
-      val baseName = SongFilenameUtils.sanitizeBaseName(track.title, track.artist)
-      val existingNames = downloadedRepo.listExistingFileNames()
-      val fileName = SongFilenameUtils.deduplicateFileName(baseName, format.extension, existingNames)
-
-      return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        writeViaMediaStore(track, fileName, format.mimeType, headSlice, stream, contentLength)
-      } else {
-        writeViaLegacyAppMusicDir(track, fileName, format.mimeType, headSlice, stream, contentLength)
-      }
+      return consumeStreamAndWriteFile(
+        track = track,
+        candidate = candidate,
+        contentType = contentType,
+        totalBytes = contentLength,
+        stream = stream,
+        onInvalidPayload = {},
+      )
     }
   }
 
-  private fun writeViaMediaStore(
+  private suspend fun consumeStreamAndWriteFile(
     track: PulseTrack,
+    candidate: AudioCandidate,
+    contentType: String,
+    totalBytes: Long,
+    stream: InputStream,
+    onInvalidPayload: () -> Unit,
+  ): DownloadedSongRecord {
+    val headBuf = ByteArray(128)
+    var headRead = 0
+    while (headRead < headBuf.size) {
+      if (!coroutineContext.isActive) throw CancellationException("Download cancelled")
+      val r = stream.read(headBuf, headRead, headBuf.size - headRead)
+      if (r <= 0) break
+      headRead += r
+    }
+    if (headRead <= 0) throw IllegalStateException("Stream returned 0 bytes")
+    val headSlice = headBuf.copyOf(headRead)
+    val format = SongFilenameUtils.inspectStreamFormat(contentType, headSlice, candidate.url)
+    if (!format.isValidAudio) {
+      onInvalidPayload()
+      throw IllegalStateException(format.rejectionReason)
+    }
+
+    val baseName = SongFilenameUtils.sanitizeBaseName(track.title, track.artist)
+    val existingNames = downloadedRepo.listExistingFileNames()
+    val fileName = SongFilenameUtils.deduplicateFileName(baseName, format.extension, existingNames)
+
+    val useMediaStore = !forceAppDirStorage && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+    return if (useMediaStore) {
+      writeViaMediaStore(track, candidate, fileName, format.mimeType, headSlice, stream, totalBytes)
+    } else {
+      writeViaPyMusicAppDir(track, candidate, fileName, format.mimeType, headSlice, stream, totalBytes)
+    }
+  }
+
+  private suspend fun writeViaMediaStore(
+    track: PulseTrack,
+    candidate: AudioCandidate,
     fileName: String,
     mimeType: String,
     headBytes: ByteArray,
-    stream: java.io.InputStream,
+    stream: InputStream,
     totalBytes: Long,
   ): DownloadedSongRecord {
     val resolver = context.contentResolver
@@ -295,50 +516,18 @@ class SongDownloadManager(
         if (track.artist.isNotBlank()) put(MediaStore.Audio.Media.ARTIST, track.artist)
         if (track.album.isNotBlank()) put(MediaStore.Audio.Media.ALBUM, track.album)
         put(MediaStore.Audio.Media.IS_MUSIC, 1)
-        put(MediaStore.Audio.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MUSIC}/Pulse")
+        put(MediaStore.Audio.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MUSIC}/${DownloadedSongsRepository.PYMUSIC_FOLDER}")
         put(MediaStore.Audio.Media.IS_PENDING, 1)
       }
     val itemUri =
       resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
         ?: throw IllegalStateException("MediaStore rejected insert")
 
-    var bytesWritten = 0L
     try {
-      resolver.openOutputStream(itemUri)?.use { out ->
-        out.write(headBytes)
-        bytesWritten += headBytes.size
-        val buf = ByteArray(16 * 1024)
-        var lastEmitMs = 0L
-        var lastPct = -1
-        while (true) {
-          val read = stream.read(buf)
-          if (read <= 0) break
-          out.write(buf, 0, read)
-          bytesWritten += read
-          val pct =
-            if (totalBytes > 0L) ((bytesWritten * 100L) / totalBytes).toInt().coerceIn(0, 99)
-            else 0
-          val now = System.currentTimeMillis()
-          if (now - lastEmitMs >= 250L || (pct != lastPct && pct % 5 == 0)) {
-            lastEmitMs = now
-            lastPct = pct
-            val progressItem =
-              DownloadProgressItem(
-                track = track,
-                status = DownloadStatus.DOWNLOADING,
-                progressPercent = pct,
-                bytesDownloaded = bytesWritten,
-                totalBytes = totalBytes,
-                fileName = fileName,
-                mimeType = mimeType,
-                updatedAtMs = now,
-              )
-            states[track.id] = progressItem
-            emitState(progressItem)
-            updateDownloadNotification(progressItem)
-          }
-        }
-      } ?: throw IllegalStateException("Unable to open MediaStore stream")
+      val bytesWritten =
+        resolver.openOutputStream(itemUri)?.use { out ->
+          copyWithProgress(track, fileName, mimeType, headBytes, stream, out, totalBytes)
+        } ?: throw IllegalStateException("Unable to open MediaStore stream")
 
       if (bytesWritten < MIN_VALID_AUDIO_BYTES) {
         throw IllegalStateException("Audio file truncated ($bytesWritten bytes)")
@@ -349,14 +538,26 @@ class SongDownloadManager(
       resolver.update(itemUri, values, null, null)
 
       val uriStr = itemUri.toString()
+      val effectiveBitrate = if (candidate.bitrate > 0) candidate.bitrate else track.bitrate
+      val effectiveItag = if (candidate.itag > 0) candidate.itag else track.itag
       return DownloadedSongRecord(
-        track = track.copy(localUri = uriStr),
+        track =
+          track.copy(
+            localUri = uriStr,
+            mimeType = mimeType,
+            bitrate = effectiveBitrate,
+            itag = effectiveItag,
+          ),
         localUri = uriStr,
         fileName = fileName,
         mimeType = mimeType,
         sizeBytes = bytesWritten,
         addedAtMs = System.currentTimeMillis(),
         isAppManaged = true,
+        bitrate = effectiveBitrate,
+        itag = effectiveItag,
+        cacheStatus =
+          if (cacheModule?.hasDownloadCacheContent(track.id) == true) "cached+file" else "completed",
       )
     } catch (t: Throwable) {
       try {
@@ -366,52 +567,23 @@ class SongDownloadManager(
     }
   }
 
-  private fun writeViaLegacyAppMusicDir(
+  private suspend fun writeViaPyMusicAppDir(
     track: PulseTrack,
+    candidate: AudioCandidate,
     fileName: String,
     mimeType: String,
     headBytes: ByteArray,
-    stream: java.io.InputStream,
+    stream: InputStream,
     totalBytes: Long,
   ): DownloadedSongRecord {
-    val dir = downloadedRepo.listAppLegacyPulseDir()
+    val dir = downloadedRepo.listAppPyMusicDir()
     val partFile = File(dir, "$fileName.part")
     val finalFile = File(dir, fileName)
-    var bytesWritten = 0L
     try {
-      FileOutputStream(partFile).use { out ->
-        out.write(headBytes)
-        bytesWritten += headBytes.size
-        val buf = ByteArray(16 * 1024)
-        var lastEmitMs = 0L
-        while (true) {
-          val read = stream.read(buf)
-          if (read <= 0) break
-          out.write(buf, 0, read)
-          bytesWritten += read
-          val pct =
-            if (totalBytes > 0L) ((bytesWritten * 100L) / totalBytes).toInt().coerceIn(0, 99)
-            else 0
-          val now = System.currentTimeMillis()
-          if (now - lastEmitMs >= 250L) {
-            lastEmitMs = now
-            val progressItem =
-              DownloadProgressItem(
-                track = track,
-                status = DownloadStatus.DOWNLOADING,
-                progressPercent = pct,
-                bytesDownloaded = bytesWritten,
-                totalBytes = totalBytes,
-                fileName = fileName,
-                mimeType = mimeType,
-                updatedAtMs = now,
-              )
-            states[track.id] = progressItem
-            emitState(progressItem)
-            updateDownloadNotification(progressItem)
-          }
+      val bytesWritten =
+        FileOutputStream(partFile).use { out ->
+          copyWithProgress(track, fileName, mimeType, headBytes, stream, out, totalBytes)
         }
-      }
       if (bytesWritten < MIN_VALID_AUDIO_BYTES) {
         throw IllegalStateException("Audio file truncated ($bytesWritten bytes)")
       }
@@ -421,19 +593,81 @@ class SongDownloadManager(
         partFile.delete()
       }
       val uriStr = Uri.fromFile(finalFile).toString()
+      val effectiveBitrate = if (candidate.bitrate > 0) candidate.bitrate else track.bitrate
+      val effectiveItag = if (candidate.itag > 0) candidate.itag else track.itag
       return DownloadedSongRecord(
-        track = track.copy(localUri = uriStr),
+        track =
+          track.copy(
+            localUri = uriStr,
+            mimeType = mimeType,
+            bitrate = effectiveBitrate,
+            itag = effectiveItag,
+          ),
         localUri = uriStr,
         fileName = fileName,
         mimeType = mimeType,
         sizeBytes = bytesWritten,
         addedAtMs = System.currentTimeMillis(),
         isAppManaged = true,
+        bitrate = effectiveBitrate,
+        itag = effectiveItag,
+        cacheStatus =
+          if (cacheModule?.hasDownloadCacheContent(track.id) == true) "cached+file" else "completed",
       )
     } catch (t: Throwable) {
       partFile.delete()
       throw t
     }
+  }
+
+  private suspend fun copyWithProgress(
+    track: PulseTrack,
+    fileName: String,
+    mimeType: String,
+    headBytes: ByteArray,
+    stream: InputStream,
+    out: OutputStream,
+    totalBytes: Long,
+  ): Long {
+    out.write(headBytes)
+    var bytesWritten = headBytes.size.toLong()
+    val buf = ByteArray(16 * 1024)
+    var lastEmitMs = 0L
+    var lastPct = -1
+
+    while (true) {
+      if (!coroutineContext.isActive) {
+        throw CancellationException("Download cancelled")
+      }
+      val read = stream.read(buf)
+      if (read <= 0) break
+      out.write(buf, 0, read)
+      bytesWritten += read
+      val pct =
+        if (totalBytes > 0L) ((bytesWritten * 100L) / totalBytes).toInt().coerceIn(0, 99)
+        else 0
+      val now = System.currentTimeMillis()
+      if (now - lastEmitMs >= 250L || (pct != lastPct && pct % 5 == 0)) {
+        lastEmitMs = now
+        lastPct = pct
+        val progressItem =
+          DownloadProgressItem(
+            track = track,
+            status = DownloadStatus.DOWNLOADING,
+            progressPercent = pct,
+            bytesDownloaded = bytesWritten,
+            totalBytes = totalBytes,
+            fileName = fileName,
+            mimeType = mimeType,
+            updatedAtMs = now,
+          )
+        states[track.id] = progressItem
+        emitState(progressItem)
+        updateDownloadNotification(progressItem)
+      }
+    }
+    out.flush()
+    return bytesWritten
   }
 
   private fun failDownload(track: PulseTrack, reason: String) {
@@ -453,6 +687,7 @@ class SongDownloadManager(
   }
 
   private fun ensureNotificationChannel() {
+    if (notificationManager == null) return
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       val channel =
         NotificationChannel(
@@ -468,6 +703,7 @@ class SongDownloadManager(
   }
 
   private fun updateDownloadNotification(item: DownloadProgressItem) {
+    val nm = notificationManager ?: return
     val builder =
       NotificationCompat.Builder(context, DOWNLOAD_CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_pulse_notification)
@@ -492,7 +728,7 @@ class SongDownloadManager(
       }
       DownloadStatus.COMPLETED -> {
         builder
-          .setContentText("Saved to Music/Pulse")
+          .setContentText("Saved to Music/PyMusic")
           .setOngoing(false)
           .setAutoCancel(true)
           .setProgress(0, 0, false)
@@ -505,12 +741,12 @@ class SongDownloadManager(
           .setProgress(0, 0, false)
       }
       DownloadStatus.CANCELLED -> {
-        notificationManager.cancel(notifIdFor(item.track.id))
+        nm.cancel(notifIdFor(item.track.id))
         return
       }
     }
     try {
-      notificationManager.notify(notifIdFor(item.track.id), builder.build())
+      nm.notify(notifIdFor(item.track.id), builder.build())
     } catch (_: SecurityException) {
       // Missing POST_NOTIFICATIONS on Android 13+: download itself still proceeds silently.
     } catch (_: Exception) {}
@@ -519,7 +755,10 @@ class SongDownloadManager(
   private fun notifIdFor(trackId: String): Int = 40_000 + (trackId.hashCode() and 0x7FFF)
 
   companion object {
-    private const val DOWNLOAD_CHANNEL_ID = "pulse_downloads"
+    private const val TAG = "SongDownloadManager"
+    private const val DOWNLOAD_CHANNEL_ID = PulseDownloadService.DOWNLOAD_CHANNEL_ID
     private const val MIN_VALID_AUDIO_BYTES = 4096L
+    private const val USER_AGENT_ANDROID =
+      "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/133.0.0.0 Mobile Safari/537.36"
   }
 }
